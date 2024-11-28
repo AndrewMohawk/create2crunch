@@ -189,7 +189,10 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     let program = Program::builder()
         .devices(device)
         .src(mk_kernel_src(&config))
-        .cmplr_opt(&format!("-cl-std=CL2.0 -D WORKGROUP_SIZE={}", work_group_size))
+        .cmplr_opt(&format!("-cl-std=CL2.0 -D WORKGROUP_SIZE={} -D TOTAL_ZEROES={} -D LEADING_ZEROES={}", 
+            work_group_size,
+            config.total_zeroes_threshold,
+            config.leading_zeroes_threshold))
         .build(&context)?;
 
     let queue = Queue::new(&context, device, None)?;
