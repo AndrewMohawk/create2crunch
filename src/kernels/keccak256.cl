@@ -222,76 +222,6 @@ static inline bool hasLeading(uchar const *d)
 }
 #endif
 
-__kernel void hashMessage(
-  __constant uchar const *d_message,
-  __constant uint const *d_nonce,
-  __global volatile ulong *restrict solutions
-) {
-  __local ulong shared_sponge[64][25];
-  const uint gid = get_global_id(0);
-  const uint lid = get_local_id(0);
-  
-  ulong *spongeBuffer = &shared_sponge[lid][0];
-#define sponge ((uchar *)spongeBuffer)
-#define digest (sponge + 12)
-
-  // Process multiple hashes per thread
-  #pragma unroll 4
-  for(uint batch = 0; batch < 4; batch++) {
-    uint current_nonce = gid * 4 + batch;
-    
-    // Initialize sponge state
-    #pragma unroll 8 
-    for(int i = 0; i < 200; i += 8) {
-      vstore8(0UL, 0, &sponge[i]);
-    }
-
-    // Set control character
-    sponge[0] = 0xffu;
-
-    // Copy factory and caller address
-    #pragma unroll
-    for(int i = 1; i < 41; i++) {
-      sponge[i] = S_##i;
-    }
-
-    // Copy message pattern
-    #pragma unroll
-    for(int i = 0; i < 4; i++) {
-      sponge[41 + i] = d_message[i];
-    }
-
-    // Set nonce
-    nonce_t nonce;
-    nonce.uint32_t[0] = current_nonce;
-    nonce.uint32_t[1] = d_nonce[0];
-    
-    #pragma unroll
-    for(int i = 0; i < 8; i++) {
-      sponge[45 + i] = nonce.uint8_t[i];
-    }
-
-    // Copy init code hash
-    #pragma unroll
-    for(int i = 53; i < 85; i++) {
-      sponge[i] = S_##i;
-    }
-
-    // Padding
-    sponge[85] = 0x01u;
-    sponge[135] = 0x80u;
-
-    // Process hash
-    keccakf(spongeBuffer);
-
-    // Check result
-    if(check_score(digest, 20)) {
-      atomic_min(&solutions[0], nonce.uint64_t);
-      return;
-    }
-  }
-}
-
 __attribute__((reqd_work_group_size(WORKGROUP_SIZE, 1, 1)))
 __kernel void hashMessage(
   __constant uchar const *d_message,
@@ -323,7 +253,7 @@ __kernel void hashMessage(
     // Copy factory and caller address
     #pragma unroll
     for(int i = 1; i < 41; i++) {
-      sponge[i] = S_##i;
+      sponge[i] = S_1 + (i-1);
     }
 
     // Copy message pattern
@@ -345,7 +275,7 @@ __kernel void hashMessage(
     // Copy init code hash
     #pragma unroll
     for(int i = 53; i < 85; i++) {
-      sponge[i] = S_##i;
+      sponge[i] = S_53 + (i-53);
     }
 
     // Padding
