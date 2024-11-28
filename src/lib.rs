@@ -24,15 +24,23 @@ const WORK_SIZE: u32 = 0x80000000;
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
-const PATTERN_BYTES: [[u8; 4]; 8] = [
+const PATTERN_BYTES: [[u8; 4]; 16] = [
     [0x00, 0x44, 0x44, 0x44],  // Direct 444 pattern
-    [0x40, 0x44, 0x40, 0x44],  // Alternating
-    [0x04, 0x44, 0x04, 0x44],  // Alternating with low 4s
-    [0x44, 0x44, 0x44, 0x00],  // Reverse pattern
-    [0x00, 0x00, 0x44, 0x44],  // Leading zeros
-    [0x44, 0x44, 0x00, 0x44],  // Pattern for end 4s
-    [0x00, 0x40, 0x44, 0x44],  // Mixed pattern
-    [0x44, 0x40, 0x44, 0x44],  // Heavy on 4s
+    [0x00, 0x00, 0x44, 0x44],  // Leading zeros + 44s
+    [0x00, 0x04, 0x44, 0x44],  // Leading zero + 444
+    [0x00, 0x44, 0x40, 0x44],  // Mixed pattern with leading zero
+    [0x40, 0x44, 0x44, 0x44],  // Heavy 4s with leading 4
+    [0x04, 0x44, 0x44, 0x44],  // Almost all 4s
+    [0x44, 0x44, 0x44, 0x40],  // Trailing pattern
+    [0x44, 0x44, 0x44, 0x04],  // Alternative trailing
+    [0x00, 0x00, 0x00, 0x44],  // Maximum leading zeros
+    [0x00, 0x00, 0x04, 0x44],  // Many leading zeros
+    [0x44, 0x44, 0x44, 0x44],  // All 4s
+    [0x00, 0x40, 0x44, 0x44],  // Mixed leading pattern
+    [0x04, 0x44, 0x44, 0x40],  // Balanced pattern
+    [0x44, 0x40, 0x44, 0x44],  // Heavy on 4s with gap
+    [0x00, 0x00, 0x40, 0x44],  // More leading zeros variant
+    [0x40, 0x44, 0x44, 0x40],  // Symmetrical pattern
 ];
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 
@@ -123,50 +131,59 @@ impl Config {
 fn score_address_hex(addr: &str) -> Option<u32> {
     let addr = addr.trim_start_matches("0x");
     let mut score = 0;
-    let mut first_non_zero_pos = None;
+    let mut first_non_zero_pos: Option<usize> = None;
+    let mut four_count = 0;
+    let mut has_four_fours = false;
+    let mut last_four_count = 0;
     
-    // Count leading zeros and find first non-zero
-    for (i, c) in addr.chars().enumerate() {
-        if c == '0' {
-            if first_non_zero_pos.is_none() {
-                score += 10;
-            }
-        } else {
-            if first_non_zero_pos.is_none() {
-                first_non_zero_pos = Some(i);
-                if c != '4' {
-                    return None;
-                }
-            }
-        }
-    }
-
-    if first_non_zero_pos.is_none() {
+    // Fast path: check if we have potential for high score
+    let leading_zeros = addr.chars()
+        .take_while(|&c| c == '0')
+        .count();
+    score += (leading_zeros * 10) as u32;
+    
+    if leading_zeros == 0 && addr.chars().next()? != '4' {
         return None;
     }
 
-    // Check for 4444 sequence
-    if let Some(pos) = addr.find("4444") {
-        score += 40;  // Base score for four 4s
-        
-        // Safely check next character after 4444 if it exists
-        if pos + 4 < addr.len() {
-            if let Some(next_char) = addr.chars().nth(pos + 4) {
-                if next_char != '4' {
+    // Count all 4s and check patterns in one pass
+    let chars: Vec<char> = addr.chars().collect();
+    let len = chars.len();
+    
+    for i in 0..len {
+        if chars[i] == '4' {
+            four_count += 1;
+            
+            // Check for 4444 pattern
+            if i <= len - 4 && 
+               chars[i] == '4' && 
+               chars[i + 1] == '4' && 
+               chars[i + 2] == '4' && 
+               chars[i + 3] == '4' {
+                has_four_fours = true;
+                score += 40;
+                
+                // Check next character after 4444
+                if i + 4 < len && chars[i + 4] != '4' {
                     score += 20;
                 }
             }
         }
+        
+        // Track last 4 characters
+        if i >= len - 4 && chars[i] == '4' {
+            last_four_count += 1;
+        }
     }
-
-    // Check last 4 characters
-    if addr.len() >= 4 && addr.ends_with("4444") {
+    
+    // Add points for all 4s
+    score += four_count as u32;
+    
+    // Add points for last four being all 4s
+    if last_four_count == 4 {
         score += 20;
     }
-
-    // Count all 4s
-    score += addr.chars().filter(|&c| c == '4').count() as u32;
-
+    
     Some(score)
 }
 
