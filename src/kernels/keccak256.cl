@@ -222,13 +222,12 @@ static inline bool hasLeading(uchar const *d)
 }
 #endif
 
-__attribute__((reqd_work_group_size(WORKGROUP_SIZE, 1, 1)))
 __kernel void hashMessage(
   __constant uchar const *d_message,
   __constant uint const *d_nonce,
-  __global volatile ulong *restrict solutions
+  __global ulong *restrict solutions
 ) {
-  __local ulong shared_sponge[32][25]; // Reduced shared memory usage
+  __local ulong shared_sponge[16][25]; // Reduced shared memory usage for better occupancy
   const uint gid = get_global_id(0);
   const uint lid = get_local_id(0);
   
@@ -245,6 +244,7 @@ __kernel void hashMessage(
     #pragma unroll 16
     for(int i = 0; i < 200; i += 8) {
       vstore8(0UL, 0, &sponge[i]);
+    }
 
     // Set control character
     sponge[0] = 0xffu;
@@ -252,7 +252,7 @@ __kernel void hashMessage(
     // Copy factory and caller address
     #pragma unroll
     for(int i = 1; i < 41; i++) {
-      sponge[i] = S_1 + (i-1);
+      sponge[i] = S_##i;
     }
 
     // Copy message pattern
@@ -274,7 +274,7 @@ __kernel void hashMessage(
     // Copy init code hash
     #pragma unroll
     for(int i = 53; i < 85; i++) {
-      sponge[i] = S_53 + (i-53);
+      sponge[i] = S_##i;
     }
 
     // Padding
