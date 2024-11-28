@@ -189,17 +189,16 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     let program = Program::builder()
         .devices(device)
         .src(mk_kernel_src(&config))
-        .cmplr_opt(&format!("-cl-std=CL2.0 -D WORKGROUP_SIZE={} -D TOTAL_ZEROES={} -D LEADING_ZEROES={} \
-             -D LOCAL_MEM_SIZE={} -cl-mad-enable -cl-fast-relaxed-math -cl-no-signed-zeros",
+        .cmplr_opt(&format!("-cl-std=CL2.0 -D WORKGROUP_SIZE={} -D TOTAL_ZEROES={} -D LEADING_ZEROES={} -cl-mad-enable \
+             -cl-fast-relaxed-math -cl-no-signed-zeros -cl-finite-math-only -cl-unsafe-math-optimizations",
             work_group_size,
             config.total_zeroes_threshold,
-            config.leading_zeroes_threshold,
-            gpu_config::get_local_mem_size()
+            config.leading_zeroes_threshold
         ))
         .build(&context)?;
 
     let queue = Queue::new(&context, device, None)?;
-    let ocl_pq = ProQue::new(context, queue, program, Some(WORK_SIZE / 64)); // Reduced work size
+    let ocl_pq = ProQue::new(context, queue, program, Some(WORK_SIZE / 256)); // Further reduced work size
     let mut rng = thread_rng();
     let start_time: f64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -225,9 +225,9 @@ static inline bool hasLeading(uchar const *d)
 __kernel void hashMessage(
   __constant uchar const *d_message,
   __constant uint const *d_nonce,
-  __global volatile ulong *restrict solutions
+  __global ulong *restrict solutions
 ) {
-  __local ulong shared_sponge[8][25]; // Further reduced shared memory
+  __local ulong shared_sponge[4][25]; // Reduced shared memory banks
   const uint gid = get_global_id(0);
   const uint lid = get_local_id(0);
   
@@ -236,12 +236,12 @@ __kernel void hashMessage(
 #define digest (sponge + 12)
 
   // Process multiple hashes per thread
-  #pragma unroll 8
-  for(uint batch = 0; batch < 8; batch++) {
-    uint current_nonce = gid * 8 + batch;
+  #pragma unroll 4
+  for(uint batch = 0; batch < 4; batch++) {
+    uint current_nonce = gid * 4 + batch;
     
     // Initialize sponge state
-    #pragma unroll 8
+    #pragma unroll 4
     for(int i = 0; i < 200; i += 8) {
       vstore8(0UL, 0, &sponge[i]);
     }
