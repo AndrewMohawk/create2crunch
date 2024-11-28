@@ -1,450 +1,531 @@
-/*
-   Copyright 2018 Lip Wee Yeo Amano
+#![warn(unused_crate_dependencies, unreachable_pub)]
+#![deny(unused_must_use, rust_2018_idioms)]
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+use alloy_primitives::{hex, Address, FixedBytes};
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use console::Term;
+use fs4::FileExt;
+use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
+use rand::{thread_rng, Rng};
+use rayon::prelude::*;
+use separator::Separatable;
+use std::error::Error;
+use std::fmt::Write as _;
+use std::fs::{File, OpenOptions};
+use std::io::prelude::*;
+use std::time::{SystemTime, UNIX_EPOCH};
+use terminal_size::{terminal_size, Height};
+use tiny_keccak::{Hasher, Keccak};
 
-     http://www.apache.org/licenses/LICENSE-2.0
+mod reward;
+pub use reward::Reward;
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
+const WORK_SIZE: u32 = 0x80000000;
+const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
+const CONTROL_CHARACTER: u8 = 0xff;
+const MAX_INCREMENTER: u64 = 0xffffffffffff;
+const PATTERN_BYTES: [[u8; 4]; 8] = [
+    [0x00, 0x44, 0x44, 0x44],  // Direct 444 pattern
+    [0x40, 0x44, 0x40, 0x44],  // Alternating
+    [0x04, 0x44, 0x04, 0x44],  // Alternating with low 4s
+    [0x44, 0x44, 0x44, 0x00],  // Reverse pattern
+    [0x00, 0x00, 0x44, 0x44],  // Leading zeros
+    [0x44, 0x44, 0x00, 0x44],  // Pattern for end 4s
+    [0x00, 0x40, 0x44, 0x44],  // Mixed pattern
+    [0x44, 0x40, 0x44, 0x44],  // Heavy on 4s
+];
+static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 
-/**
-* Based on the following, with small tweaks and optimizations:
-*
-* https://github.com/lwYeo/SoliditySHA3Miner/blob/master/SoliditySHA3Miner/
-*   Miner/Kernels/OpenCL/sha3KingKernel.cl
-*
-* Originally modified for openCL processing by lwYeo
-*
-* Original implementor: David Leon Gil
-*
-* License: CC0, attribution kindly requested. Blame taken too, but not
-* liability.
-*/
-
-/******** Keccak-f[1600] (for finding efficient Ethereum addresses) ********/
-
-#define OPENCL_PLATFORM_UNKNOWN 0
-#define OPENCL_PLATFORM_AMD   2
-
-#ifndef PLATFORM
-# define PLATFORM       OPENCL_PLATFORM_UNKNOWN
-#endif
-
-#if PLATFORM == OPENCL_PLATFORM_AMD
-# pragma OPENCL EXTENSION   cl_amd_media_ops : enable
-#endif
-
-typedef union _nonce_t
-{
-  ulong   uint64_t;
-  uint    uint32_t[2];
-  uchar   uint8_t[8];
-} nonce_t;
-
-#if PLATFORM == OPENCL_PLATFORM_AMD
-static inline ulong rol(const ulong x, const uint s)
-{
-  uint2 output;
-  uint2 x2 = as_uint2(x);
-
-  output = (s > 32u) ? amd_bitalign((x2).yx, (x2).xy, 64u - s) : amd_bitalign((x2).xy, (x2).yx, 32u - s);
-  return as_ulong(output);
-}
-#else
-#define rol(x, s) (((x) << s) | ((x) >> (64u - s)))
-#endif
-
-#define is_four(x) ((x) == 0x4)
-#define is_zero(x) ((x) == 0x0)
-
-#define check_nibble(byte, high) (high ? ((byte) >> 4) : ((byte) & 0xF))
-
-#define score_address(d) ({ \
-  int score = 0; \
-  bool found_first = false; \
-  int consecutive_fours = 0; \
-  int last_four_count = 0; \
-  bool has_four_sequence = false; \
-  \
-  /* Check first 20 bytes (40 nibbles) */ \
-  for(int i = 0; i < 20; i++) { \
-    uchar high = check_nibble(d[i], 1); \
-    uchar low = check_nibble(d[i], 0); \
-    \
-    /* Process high nibble */ \
-    if(!found_first) { \
-      if(is_zero(high)) { \
-        score += 10; \
-      } else { \
-        found_first = true; \
-        if(!is_four(high)) return 0; \
-      } \
-    } \
-    \
-    /* Count fours and check sequences */ \
-    if(is_four(high)) { \
-      score += 1; \
-      consecutive_fours++; \
-      if(consecutive_fours == 4 && !has_four_sequence) { \
-        score += 40; \
-        has_four_sequence = true; \
-        /* Check next nibble after sequence */ \
-        if(i < 19 && !is_four(low)) { \
-          score += 20; \
-        } \
-      } \
-    } else { \
-      consecutive_fours = 0; \
-    } \
-    \
-    /* Process low nibble */ \
-    if(!found_first) { \
-      if(is_zero(low)) { \
-        score += 10; \
-      } else { \
-        found_first = true; \
-        if(!is_four(low)) return 0; \
-      } \
-    } \
-    \
-    if(is_four(low)) { \
-      score += 1; \
-      consecutive_fours++; \
-      if(consecutive_fours == 4 && !has_four_sequence) { \
-        score += 40; \
-        has_four_sequence = true; \
-        /* Check next byte's high nibble */ \
-        if(i < 19 && !is_four(check_nibble(d[i+1], 1))) { \
-          score += 20; \
-        } \
-      } \
-    } else { \
-      consecutive_fours = 0; \
-    } \
-    \
-    /* Track last 4 nibbles */ \
-    if(i >= 18) { \
-      if(is_four(high)) last_four_count++; \
-      if(is_four(low)) last_four_count++; \
-    } \
-  } \
-  \
-  /* Add points for last four being all 4s */ \
-  if(last_four_count == 4) { \
-    score += 20; \
-  } \
-  \
-  score; \
-})
-
-#define rol1(x) rol(x, 1u)
-
-#define theta_(m, n, o) \
-t = b[m] ^ rol1(b[n]); \
-a[o + 0] ^= t; \
-a[o + 5] ^= t; \
-a[o + 10] ^= t; \
-a[o + 15] ^= t; \
-a[o + 20] ^= t; \
-
-#define theta() \
-b[0] = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20]; \
-b[1] = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21]; \
-b[2] = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22]; \
-b[3] = a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23]; \
-b[4] = a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24]; \
-theta_(4, 1, 0); \
-theta_(0, 2, 1); \
-theta_(1, 3, 2); \
-theta_(2, 4, 3); \
-theta_(3, 0, 4);
-
-#define rhoPi_(m, n) t = b[0]; b[0] = a[m]; a[m] = rol(t, n); \
-
-#define rhoPi() t = a[1]; b[0] = a[10]; a[10] = rol1(t); \
-rhoPi_(7, 3); \
-rhoPi_(11, 6); \
-rhoPi_(17, 10); \
-rhoPi_(18, 15); \
-rhoPi_(3, 21); \
-rhoPi_(5, 28); \
-rhoPi_(16, 36); \
-rhoPi_(8, 45); \
-rhoPi_(21, 55); \
-rhoPi_(24, 2); \
-rhoPi_(4, 14); \
-rhoPi_(15, 27); \
-rhoPi_(23, 41); \
-rhoPi_(19, 56); \
-rhoPi_(13, 8); \
-rhoPi_(12, 25); \
-rhoPi_(2, 43); \
-rhoPi_(20, 62); \
-rhoPi_(14, 18); \
-rhoPi_(22, 39); \
-rhoPi_(9, 61); \
-rhoPi_(6, 20); \
-rhoPi_(1, 44);
-
-#define chi_(n) \
-b[0] = a[n + 0]; \
-b[1] = a[n + 1]; \
-b[2] = a[n + 2]; \
-b[3] = a[n + 3]; \
-b[4] = a[n + 4]; \
-a[n + 0] = b[0] ^ ((~b[1]) & b[2]); \
-a[n + 1] = b[1] ^ ((~b[2]) & b[3]); \
-a[n + 2] = b[2] ^ ((~b[3]) & b[4]); \
-a[n + 3] = b[3] ^ ((~b[4]) & b[0]); \
-a[n + 4] = b[4] ^ ((~b[0]) & b[1]);
-
-#define chi() chi_(0); chi_(5); chi_(10); chi_(15); chi_(20);
-
-#define iota(x) a[0] ^= x;
-
-#define iteration(x) theta(); rhoPi(); chi(); iota(x);
-
-static inline void keccakf(ulong *a)
-{
-  ulong b[5];
-  ulong t;
-
-  iteration(0x0000000000000001); // iteration 1
-  iteration(0x0000000000008082); // iteration 2
-  iteration(0x800000000000808a); // iteration 3
-  iteration(0x8000000080008000); // iteration 4
-  iteration(0x000000000000808b); // iteration 5
-  iteration(0x0000000080000001); // iteration 6
-  iteration(0x8000000080008081); // iteration 7
-  iteration(0x8000000000008009); // iteration 8
-  iteration(0x000000000000008a); // iteration 9
-  iteration(0x0000000000000088); // iteration 10
-  iteration(0x0000000080008009); // iteration 11
-  iteration(0x000000008000000a); // iteration 12
-  iteration(0x000000008000808b); // iteration 13
-  iteration(0x800000000000008b); // iteration 14
-  iteration(0x8000000000008089); // iteration 15
-  iteration(0x8000000000008003); // iteration 16
-  iteration(0x8000000000008002); // iteration 17
-  iteration(0x8000000000000080); // iteration 18
-  iteration(0x000000000000800a); // iteration 19
-  iteration(0x800000008000000a); // iteration 20
-  iteration(0x8000000080008081); // iteration 21
-  iteration(0x8000000000008080); // iteration 22
-  iteration(0x0000000080000001); // iteration 23
-
-  // iteration 24 (partial)
-
-#define o ((uint *)(a))
-  // Theta (partial)
-  b[0] = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20];
-  b[1] = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21];
-  b[2] = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22];
-  b[3] = a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23];
-  b[4] = a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24];
-
-  a[0] ^= b[4] ^ rol1(b[1]);
-  a[6] ^= b[0] ^ rol1(b[2]);
-  a[12] ^= b[1] ^ rol1(b[3]);
-  a[18] ^= b[2] ^ rol1(b[4]);
-  a[24] ^= b[3] ^ rol1(b[0]);
-
-  // Rho Pi (partial)
-  o[3] = (o[13] >> 20) | (o[12] << 12);
-  a[2] = rol(a[12], 43);
-  a[3] = rol(a[18], 21);
-  a[4] = rol(a[24], 14);
-
-  // Chi (partial)
-  o[3] ^= ((~o[5]) & o[7]);
-  o[4] ^= ((~o[6]) & o[8]);
-  o[5] ^= ((~o[7]) & o[9]);
-  o[6] ^= ((~o[8]) & o[0]);
-  o[7] ^= ((~o[9]) & o[1]);
-#undef o
+pub struct Config {
+    pub factory_address: [u8; 20],
+    pub calling_address: [u8; 20],
+    pub init_code_hash: [u8; 32],
+    pub gpu_device: u8,
+    pub leading_zeroes_threshold: u8,
+    pub total_zeroes_threshold: u8,
 }
 
-#define hasTotal(d) ( \
-  (!(d[0])) + (!(d[1])) + (!(d[2])) + (!(d[3])) + \
-  (!(d[4])) + (!(d[5])) + (!(d[6])) + (!(d[7])) + \
-  (!(d[8])) + (!(d[9])) + (!(d[10])) + (!(d[11])) + \
-  (!(d[12])) + (!(d[13])) + (!(d[14])) + (!(d[15])) + \
-  (!(d[16])) + (!(d[17])) + (!(d[18])) + (!(d[19])) \
->= TOTAL_ZEROES)
+impl Config {
+    pub fn new(mut args: std::env::Args) -> Result<Self, &'static str> {
+        args.next();
 
-#if LEADING_ZEROES == 8
-#define hasLeading(d) (!(((uint*)d)[0]) && !(((uint*)d)[1]))
-#elif LEADING_ZEROES == 7
-#define hasLeading(d) (!(((uint*)d)[0]) && !(((uint*)d)[1] & 0x00ffffffu))
-#elif LEADING_ZEROES == 6
-#define hasLeading(d) (!(((uint*)d)[0]) && !(((uint*)d)[1] & 0x0000ffffu))
-#elif LEADING_ZEROES == 5
-#define hasLeading(d) (!(((uint*)d)[0]) && !(((uint*)d)[1] & 0x000000ffu))
-#elif LEADING_ZEROES == 4
-#define hasLeading(d) (!(((uint*)d)[0]))
-#elif LEADING_ZEROES == 3
-#define hasLeading(d) (!(((uint*)d)[0] & 0x00ffffffu))
-#elif LEADING_ZEROES == 2
-#define hasLeading(d) (!(((uint*)d)[0] & 0x0000ffffu))
-#elif LEADING_ZEROES == 1
-#define hasLeading(d) (!(((uint*)d)[0] & 0x000000ffu))
-#else
-static inline bool hasLeading(uchar const *d)
-{
-#pragma unroll
-  for (uint i = 0; i < LEADING_ZEROES; ++i) {
-    if (d[i] != 0) return false;
-  }
-  return true;
+        let Some(factory_address_string) = args.next() else {
+            return Err("didn't get a factory_address argument");
+        };
+        let Some(calling_address_string) = args.next() else {
+            return Err("didn't get a calling_address argument");
+        };
+        let Some(init_code_hash_string) = args.next() else {
+            return Err("didn't get an init_code_hash argument");
+        };
+
+        let gpu_device_string = match args.next() {
+            Some(arg) => arg,
+            None => String::from("255"),
+        };
+        let leading_zeroes_threshold_string = match args.next() {
+            Some(arg) => arg,
+            None => String::from("3"),
+        };
+        let total_zeroes_threshold_string = match args.next() {
+            Some(arg) => arg,
+            None => String::from("5"),
+        };
+
+        let Ok(factory_address_vec) = hex::decode(factory_address_string) else {
+            return Err("could not decode factory address argument");
+        };
+        let Ok(calling_address_vec) = hex::decode(calling_address_string) else {
+            return Err("could not decode calling address argument");
+        };
+        let Ok(init_code_hash_vec) = hex::decode(init_code_hash_string) else {
+            return Err("could not decode initialization code hash argument");
+        };
+
+        let Ok(factory_address) = factory_address_vec.try_into() else {
+            return Err("invalid length for factory address argument");
+        };
+        let Ok(calling_address) = calling_address_vec.try_into() else {
+            return Err("invalid length for calling address argument");
+        };
+        let Ok(init_code_hash) = init_code_hash_vec.try_into() else {
+            return Err("invalid length for initialization code hash argument");
+        };
+
+        let Ok(gpu_device) = gpu_device_string.parse::<u8>() else {
+            return Err("invalid gpu device value");
+        };
+        let Ok(leading_zeroes_threshold) = leading_zeroes_threshold_string.parse::<u8>() else {
+            return Err("invalid leading zeroes threshold value supplied");
+        };
+        let Ok(total_zeroes_threshold) = total_zeroes_threshold_string.parse::<u8>() else {
+            return Err("invalid total zeroes threshold value supplied");
+        };
+
+        if leading_zeroes_threshold > 20 {
+            return Err("invalid value for leading zeroes threshold argument. (valid: 0..=20)");
+        }
+        if total_zeroes_threshold > 20 && total_zeroes_threshold != 255 {
+            return Err("invalid value for total zeroes threshold argument. (valid: 0..=20 | 255)");
+        }
+
+        Ok(Self {
+            factory_address,
+            calling_address,
+            init_code_hash,
+            gpu_device,
+            leading_zeroes_threshold,
+            total_zeroes_threshold,
+        })
+    }
 }
-#endif
 
-__kernel void hashMessage(
-  __constant uchar const *d_message,
-  __constant uint const *d_nonce,
-  __global volatile ulong *restrict solutions
-) {
+fn score_address_hex(addr: &str) -> Option<u32> {
+    let addr = addr.trim_start_matches("0x");
+    let mut score = 0;
+    let mut first_non_zero_pos = None;
+    
+    // Count leading zeros and find first non-zero
+    for (i, c) in addr.chars().enumerate() {
+        if c == '0' {
+            if first_non_zero_pos.is_none() {
+                score += 10;
+            }
+        } else {
+            if first_non_zero_pos.is_none() {
+                first_non_zero_pos = Some(i);
+                if c != '4' {
+                    return None;
+                }
+            }
+        }
+    }
 
-  ulong spongeBuffer[25];
+    if first_non_zero_pos.is_none() {
+        return None;
+    }
 
-#define sponge ((uchar *) spongeBuffer)
-#define digest (sponge + 12)
+    // Check for 4444 sequence
+    if let Some(pos) = addr.find("4444") {
+        score += 40;  // Base score for four 4s
+        
+        // Safely check next character after 4444 if it exists
+        if pos + 4 < addr.len() {
+            if let Some(next_char) = addr.chars().nth(pos + 4) {
+                if next_char != '4' {
+                    score += 20;
+                }
+            }
+        }
+    }
 
-  nonce_t nonce;
+    // Check last 4 characters
+    if addr.len() >= 4 && addr.ends_with("4444") {
+        score += 20;
+    }
 
-  // write the control character
-  sponge[0] = 0xffu;
+    // Count all 4s
+    score += addr.chars().filter(|&c| c == '4').count() as u32;
 
-  sponge[1] = S_1;
-  sponge[2] = S_2;
-  sponge[3] = S_3;
-  sponge[4] = S_4;
-  sponge[5] = S_5;
-  sponge[6] = S_6;
-  sponge[7] = S_7;
-  sponge[8] = S_8;
-  sponge[9] = S_9;
-  sponge[10] = S_10;
-  sponge[11] = S_11;
-  sponge[12] = S_12;
-  sponge[13] = S_13;
-  sponge[14] = S_14;
-  sponge[15] = S_15;
-  sponge[16] = S_16;
-  sponge[17] = S_17;
-  sponge[18] = S_18;
-  sponge[19] = S_19;
-  sponge[20] = S_20;
-  sponge[21] = S_21;
-  sponge[22] = S_22;
-  sponge[23] = S_23;
-  sponge[24] = S_24;
-  sponge[25] = S_25;
-  sponge[26] = S_26;
-  sponge[27] = S_27;
-  sponge[28] = S_28;
-  sponge[29] = S_29;
-  sponge[30] = S_30;
-  sponge[31] = S_31;
-  sponge[32] = S_32;
-  sponge[33] = S_33;
-  sponge[34] = S_34;
-  sponge[35] = S_35;
-  sponge[36] = S_36;
-  sponge[37] = S_37;
-  sponge[38] = S_38;
-  sponge[39] = S_39;
-  sponge[40] = S_40;
+    Some(score)
+}
 
-  sponge[41] = d_message[0];
-  sponge[42] = d_message[1];
-  sponge[43] = d_message[2];
-  sponge[44] = d_message[3];
+pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
+    let file = output_file();
+    //let rewards = Reward::new();
 
-  // populate the nonce
-  nonce.uint32_t[0] = get_global_id(0);
-  nonce.uint32_t[1] = d_nonce[0];
+    loop {
+        let mut header = [0; 47];
+        header[0] = CONTROL_CHARACTER;
+        header[1..21].copy_from_slice(&config.factory_address);
+        header[21..41].copy_from_slice(&config.calling_address);
+        header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
 
-  // populate the body of the message with the nonce
-  sponge[45] = nonce.uint8_t[0];
-  sponge[46] = nonce.uint8_t[1];
-  sponge[47] = nonce.uint8_t[2];
-  sponge[48] = nonce.uint8_t[3];
-  sponge[49] = nonce.uint8_t[4];
-  sponge[50] = nonce.uint8_t[5];
-  sponge[51] = nonce.uint8_t[6];
-  sponge[52] = nonce.uint8_t[7];
+        let mut hash_header = Keccak::v256();
+        hash_header.update(&header);
 
-  sponge[53] = S_53;
-  sponge[54] = S_54;
-  sponge[55] = S_55;
-  sponge[56] = S_56;
-  sponge[57] = S_57;
-  sponge[58] = S_58;
-  sponge[59] = S_59;
-  sponge[60] = S_60;
-  sponge[61] = S_61;
-  sponge[62] = S_62;
-  sponge[63] = S_63;
-  sponge[64] = S_64;
-  sponge[65] = S_65;
-  sponge[66] = S_66;
-  sponge[67] = S_67;
-  sponge[68] = S_68;
-  sponge[69] = S_69;
-  sponge[70] = S_70;
-  sponge[71] = S_71;
-  sponge[72] = S_72;
-  sponge[73] = S_73;
-  sponge[74] = S_74;
-  sponge[75] = S_75;
-  sponge[76] = S_76;
-  sponge[77] = S_77;
-  sponge[78] = S_78;
-  sponge[79] = S_79;
-  sponge[80] = S_80;
-  sponge[81] = S_81;
-  sponge[82] = S_82;
-  sponge[83] = S_83;
-  sponge[84] = S_84;
+        (0..MAX_INCREMENTER)
+            .into_par_iter()
+            .for_each(|salt| {
+                let salt = salt.to_le_bytes();
+                let salt_incremented_segment = &salt[..6];
 
-  // begin padding based on message length
-  sponge[85] = 0x01u;
+                let mut hash = hash_header.clone();
+                hash.update(salt_incremented_segment);
+                hash.update(&config.init_code_hash);
 
-  // fill padding
-#pragma unroll
-  for (int i = 86; i < 135; ++i)
-    sponge[i] = 0;
+                let mut res: [u8; 32] = [0; 32];
+                hash.finalize(&mut res);
 
-  // end padding
-  sponge[135] = 0x80u;
+                let address = <&Address>::try_from(&res[12..]).unwrap();
+                let address_hex = format!("{address}");
 
-  // fill remaining sponge state with zeroes
-#pragma unroll
-  for (int i = 136; i < 200; ++i)
-    sponge[i] = 0;
+                if let Some(score) = score_address_hex(&address_hex) {
+                    if score > 62 {
+                        let header_hex_string = hex::encode(header);
+                        let body_hex_string = hex::encode(salt_incremented_segment);
+                        let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
 
-  // Apply keccakf
-  keccakf(spongeBuffer);
+                        let output = format!(
+                            "{full_salt} => {address} => {score}"
+                        );
+                        println!("{output}");
 
-  // Score the address and check if it beats current best
-  int score = score_address(digest);
-  if (score > 174) {
-    solutions[0] = nonce.uint64_t;
-  } else if (
-    hasLeading(digest) 
-#if TOTAL_ZEROES <= 20
-    || hasTotal(digest)
-#endif
-  ) {
-    // Keep existing zero-based checks as fallback
-    solutions[0] = nonce.uint64_t;
-  }
+                        file.lock_exclusive().expect("Couldn't lock file.");
+                        writeln!(&file, "{output}")
+                            .expect("Couldn't write to `efficient_addresses.txt` file.");
+                        file.unlock().expect("Couldn't unlock file.");
+                    }
+                }
+            });
+    }
+}
+
+pub fn gpu(config: Config) -> ocl::Result<()> {
+    println!(
+        "Setting up experimental OpenCL miner using device {}...",
+        config.gpu_device
+    );
+    println!("Starting pattern-based mining...");
+    let mut pattern_index: usize = 0;
+
+    let file = output_file();
+    let mut found: u64 = 0;
+    let mut found_list: Vec<String> = vec![];
+    let term = Term::stdout();
+    let platform = Platform::new(ocl::core::default_platform()?);
+    let device = Device::by_idx_wrap(platform, config.gpu_device as usize)?;
+    let context = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
+    let program = Program::builder()
+        .devices(device)
+        .src(mk_kernel_src(&config))
+        .build(&context)?;
+    let queue = Queue::new(&context, device, None)?;
+    let ocl_pq = ProQue::new(context, queue, program, Some(WORK_SIZE));
+    let mut rng = thread_rng();
+    let start_time: f64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let mut rate: f64 = 0.0;
+    let mut cumulative_nonce: u64 = 0;
+    let mut previous_time: f64 = 0.0;
+    let mut work_duration_millis: u64 = 0;
+
+    loop {
+        let current_pattern = PATTERN_BYTES[pattern_index];
+        pattern_index = (pattern_index + 1) % PATTERN_BYTES.len();
+
+        let mut pattern = [0u8; 4];
+        pattern.copy_from_slice(&current_pattern);
+        let salt = FixedBytes::<4>::try_from(&pattern[..]).unwrap();
+
+        let message_buffer = Buffer::builder()
+            .queue(ocl_pq.queue().clone())
+            .flags(MemFlags::new().read_only())
+            .len(4)
+            .copy_host_slice(&salt[..])
+            .build()?;
+
+        let mut nonce: [u32; 1] = rng.gen();
+        let mut view_buf = [0; 8];
+        let mut nonce_buffer = Buffer::builder()
+            .queue(ocl_pq.queue().clone())
+            .flags(MemFlags::new().read_only())
+            .len(1)
+            .copy_host_slice(&nonce)
+            .build()?;
+
+        let mut solutions: Vec<u64> = vec![0; 1];
+        let solutions_buffer = Buffer::builder()
+            .queue(ocl_pq.queue().clone())
+            .flags(MemFlags::new().write_only())
+            .len(1)
+            .copy_host_slice(&solutions)
+            .build()?;
+
+        loop {
+            let kern = ocl_pq
+                .kernel_builder("hashMessage")
+                .arg_named("message", None::<&Buffer<u8>>)
+                .arg_named("nonce", None::<&Buffer<u32>>)
+                .arg_named("solutions", None::<&Buffer<u64>>)
+                .build()?;
+
+            kern.set_arg("message", Some(&message_buffer))?;
+            kern.set_arg("nonce", Some(&nonce_buffer))?;
+            kern.set_arg("solutions", &solutions_buffer)?;
+
+            unsafe { kern.enq()? };
+
+            let mut now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            let current_time = now.as_secs() as f64;
+            let print_output = current_time - previous_time > 0.99;
+            previous_time = current_time;
+
+            if print_output {
+                term.clear_screen()?;
+                let total_runtime = current_time - start_time;
+                let total_runtime_hrs = total_runtime as u64 / 3600;
+                let total_runtime_mins = (total_runtime as u64 - total_runtime_hrs * 3600) / 60;
+                let total_runtime_secs = total_runtime
+                    - (total_runtime_hrs * 3600) as f64
+                    - (total_runtime_mins * 60) as f64;
+
+                let work_rate: u128 = WORK_FACTOR * cumulative_nonce as u128;
+                if total_runtime > 0.0 {
+                    rate = 1.0 / total_runtime;
+                }
+
+                LittleEndian::write_u64(&mut view_buf, (nonce[0] as u64) << 32);
+                let height = terminal_size().map(|(_w, Height(h))| h).unwrap_or(10);
+
+                term.write_line(&format!(
+                    "total runtime: {}:{:02}:{:02} ({} cycles)\t\t\t\
+                     work size per cycle: {}",
+                    total_runtime_hrs,
+                    total_runtime_mins,
+                    total_runtime_secs,
+                    cumulative_nonce,
+                    WORK_SIZE.separated_string(),
+                ))?;
+
+                term.write_line(&format!(
+                    "rate: {:.2} million attempts per second\t\t\t\
+                     total found this run: {}",
+                    work_rate as f64 * rate,
+                    found
+                ))?;
+
+                term.write_line(&format!(
+                    "current search space: {}xxxxxxxx{:08x}\t\t\
+                     threshold: {} leading or {} total zeroes",
+                    hex::encode(salt),
+                    BigEndian::read_u64(&view_buf),
+                    config.leading_zeroes_threshold,
+                    config.total_zeroes_threshold
+                ))?;
+
+                let rows = if height < 5 { 1 } else { height as usize - 4 };
+                let last_rows: Vec<String> = found_list.iter().cloned().rev().take(rows).collect();
+                let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
+                let recently_found = &ordered.join("\n");
+                term.write_line(recently_found)?;
+            }
+
+            cumulative_nonce += 1;
+            let work_start_time_millis = now.as_secs() * 1000 + now.subsec_nanos() as u64 / 1000000;
+
+            if work_duration_millis != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    work_duration_millis * 980 / 1000,
+                ));
+            }
+
+            solutions_buffer.read(&mut solutions).enq()?;
+
+            now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            work_duration_millis = (now.as_secs() * 1000 + now.subsec_nanos() as u64 / 1000000)
+                - work_start_time_millis;
+
+            if solutions[0] != 0 {
+                break;
+            }
+
+            nonce[0] += 1;
+            nonce_buffer = Buffer::builder()
+                .queue(ocl_pq.queue().clone())
+                .flags(MemFlags::new().read_write())
+                .len(1)
+                .copy_host_slice(&nonce)
+                .build()?;
+        }
+
+        for &solution in &solutions {
+            if solution == 0 {
+                continue;
+            }
+
+            let solution = solution.to_le_bytes();
+
+            let mut solution_message = [0; 85];
+            solution_message[0] = CONTROL_CHARACTER;
+            solution_message[1..21].copy_from_slice(&config.factory_address);
+            solution_message[21..41].copy_from_slice(&config.calling_address);
+            solution_message[41..45].copy_from_slice(&salt[..]);
+            solution_message[45..53].copy_from_slice(&solution);
+            solution_message[53..].copy_from_slice(&config.init_code_hash);
+
+            let mut hash = Keccak::v256();
+            hash.update(&solution_message);
+
+            let mut res: [u8; 32] = [0; 32];
+            hash.finalize(&mut res);
+
+            let address = <&Address>::try_from(&res[12..]).unwrap();
+            let address_hex = format!("{}", address);
+
+            if let Some(score) = score_address_hex(&address_hex) {
+                if score > 174 {
+                    found += 1;
+                    let output = format!(
+                        "0x{}{}{} => {} => {}",
+                        hex::encode(config.calling_address),
+                        hex::encode(salt),
+                        hex::encode(solution),
+                        address,
+                        score
+                    );
+
+                    let show = format!("{output} (Score: {score})");
+                    found_list.push(show.to_string());
+
+                    file.lock_exclusive().expect("Couldn't lock file.");
+                    writeln!(&file, "{output}")
+                        .expect("Couldn't write to `efficient_addresses.txt` file.");
+                    file.unlock().expect("Couldn't unlock file.");
+                }
+            }
+        }
+    }
+}
+
+#[track_caller]
+fn output_file() -> File {
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .read(true)
+        .open("efficient_addresses.txt")
+        .expect("Could not create or open `efficient_addresses.txt` file.")
+}
+
+fn get_score_check_code() -> String {
+    r#"
+    bool check_score(uchar* addr, int addr_len) {
+        int score = 0;
+        bool found_first = false;
+        int first_non_zero = -1;
+        
+        // Count leading zeros and check first non-zero is 4
+        for(int i = 0; i < addr_len * 2; i++) {
+            uchar nibble = (i % 2 == 0) ? (addr[i/2] >> 4) : (addr[i/2] & 0xF);
+            if(!found_first) {
+                if(nibble == 0) {
+                    score += 10;
+                } else {
+                    found_first = true;
+                    first_non_zero = i;
+                    if(nibble != 4) return false;
+                }
+            }
+            
+            // Count total 4s
+            if(nibble == 4) {
+                score += 1;
+            }
+        }
+        
+        // Look for 4444 sequence
+        bool found_four_fours = false;
+        for(int i = 0; i < addr_len * 2 - 3; i++) {
+            uchar n1 = (i % 2 == 0) ? (addr[i/2] >> 4) : (addr[i/2] & 0xF);
+            uchar n2 = ((i+1) % 2 == 0) ? (addr[(i+1)/2] >> 4) : (addr[(i+1)/2] & 0xF);
+            uchar n3 = ((i+2) % 2 == 0) ? (addr[(i+2)/2] >> 4) : (addr[(i+2)/2] & 0xF);
+            uchar n4 = ((i+3) % 2 == 0) ? (addr[(i+3)/2] >> 4) : (addr[(i+3)/2] & 0xF);
+            
+            if(n1 == 4 && n2 == 4 && n3 == 4 && n4 == 4) {
+                score += 40;
+                if(i + 4 < addr_len * 2) {
+                    uchar next = ((i+4) % 2 == 0) ? (addr[(i+4)/2] >> 4) : (addr[(i+4)/2] & 0xF);
+                    if(next != 4) score += 20;
+                }
+                found_four_fours = true;
+                break;
+            }
+        }
+
+        // Check last 4 nibbles for 4444
+        int last_start = addr_len * 2 - 4;
+        if(last_start >= 0) {
+            bool last_four = true;
+            for(int i = 0; i < 4; i++) {
+                uchar n = ((last_start + i) % 2 == 0) ? 
+                    (addr[(last_start + i)/2] >> 4) : 
+                    (addr[(last_start + i)/2] & 0xF);
+                if(n != 4) {
+                    last_four = false;
+                    break;
+                }
+            }
+            if(last_four) score += 20;
+        }
+        
+        return score > 62;  // Using your new threshold
+    }
+    "#.to_string()
+}
+
+fn mk_kernel_src(config: &Config) -> String {
+    let mut src = String::with_capacity(2048 + KERNEL_SRC.len());
+    
+    let factory = config.factory_address.iter();
+    let caller = config.calling_address.iter();
+    let hash = config.init_code_hash.iter();
+    let hash = hash.enumerate().map(|(i, x)| (i + 52, x));
+    for (i, x) in factory.chain(caller).enumerate().chain(hash) {
+        writeln!(src, "#define S_{} {}u", i + 1, x).unwrap();
+    }
+    let lz = config.leading_zeroes_threshold;
+    writeln!(src, "#define LEADING_ZEROES {lz}").unwrap();
+    let tz = config.total_zeroes_threshold;
+    writeln!(src, "#define TOTAL_ZEROES {tz}").unwrap();
+
+    src.push_str(&get_score_check_code());
+    src.push_str(KERNEL_SRC);
+
+    src
 }
