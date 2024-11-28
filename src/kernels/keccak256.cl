@@ -128,9 +128,10 @@ a[n + 4] = b[4] ^ ((~b[0]) & b[1]);
 
 #define iteration(x) theta(); rhoPi(); chi(); iota(x);
 
+__attribute__((reqd_work_group_size(256, 1, 1)))
 static inline void keccakf(ulong *a)
 {
-  ulong b[5];
+  ulong b[5] __attribute__((aligned(32)));
   ulong t;
 
   iteration(0x0000000000000001); // iteration 1
@@ -158,7 +159,6 @@ static inline void keccakf(ulong *a)
   iteration(0x0000000080000001); // iteration 23
 
   // iteration 24 (partial)
-
 #define o ((uint *)(a))
   // Theta (partial)
   b[0] = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20];
@@ -228,140 +228,67 @@ __kernel void hashMessage(
   __constant uint const *d_nonce,
   __global volatile ulong *restrict solutions
 ) {
-
-  ulong spongeBuffer[25];
-
-#define sponge ((uchar *) spongeBuffer)
+  __local ulong shared_sponge[64][25];
+  const uint gid = get_global_id(0);
+  const uint lid = get_local_id(0);
+  
+  ulong *spongeBuffer = &shared_sponge[lid][0];
+#define sponge ((uchar *)spongeBuffer)
 #define digest (sponge + 12)
 
-  nonce_t nonce;
+  // Process multiple hashes per thread
+  #pragma unroll 4
+  for(uint batch = 0; batch < 4; batch++) {
+    uint current_nonce = gid * 4 + batch;
+    
+    // Initialize sponge state
+    #pragma unroll 8 
+    for(int i = 0; i < 200; i += 8) {
+      vstore8(0UL, 0, &sponge[i]);
+    }
 
-  // write the control character
-  sponge[0] = 0xffu;
+    // Set control character
+    sponge[0] = 0xffu;
 
-  sponge[1] = S_1;
-  sponge[2] = S_2;
-  sponge[3] = S_3;
-  sponge[4] = S_4;
-  sponge[5] = S_5;
-  sponge[6] = S_6;
-  sponge[7] = S_7;
-  sponge[8] = S_8;
-  sponge[9] = S_9;
-  sponge[10] = S_10;
-  sponge[11] = S_11;
-  sponge[12] = S_12;
-  sponge[13] = S_13;
-  sponge[14] = S_14;
-  sponge[15] = S_15;
-  sponge[16] = S_16;
-  sponge[17] = S_17;
-  sponge[18] = S_18;
-  sponge[19] = S_19;
-  sponge[20] = S_20;
-  sponge[21] = S_21;
-  sponge[22] = S_22;
-  sponge[23] = S_23;
-  sponge[24] = S_24;
-  sponge[25] = S_25;
-  sponge[26] = S_26;
-  sponge[27] = S_27;
-  sponge[28] = S_28;
-  sponge[29] = S_29;
-  sponge[30] = S_30;
-  sponge[31] = S_31;
-  sponge[32] = S_32;
-  sponge[33] = S_33;
-  sponge[34] = S_34;
-  sponge[35] = S_35;
-  sponge[36] = S_36;
-  sponge[37] = S_37;
-  sponge[38] = S_38;
-  sponge[39] = S_39;
-  sponge[40] = S_40;
+    // Copy factory and caller address
+    #pragma unroll
+    for(int i = 1; i < 41; i++) {
+      sponge[i] = *(&S_1 + (i-1));
+    }
 
-  sponge[41] = d_message[0];
-  sponge[42] = d_message[1];
-  sponge[43] = d_message[2];
-  sponge[44] = d_message[3];
+    // Copy message pattern
+    #pragma unroll
+    for(int i = 0; i < 4; i++) {
+      sponge[41 + i] = d_message[i];
+    }
 
-  // populate the nonce
-  nonce.uint32_t[0] = get_global_id(0);
-  nonce.uint32_t[1] = d_nonce[0];
+    // Set nonce
+    nonce_t nonce;
+    nonce.uint32_t[0] = current_nonce;
+    nonce.uint32_t[1] = d_nonce[0];
+    
+    #pragma unroll
+    for(int i = 0; i < 8; i++) {
+      sponge[45 + i] = nonce.uint8_t[i];
+    }
 
-  // populate the body of the message with the nonce
-  sponge[45] = nonce.uint8_t[0];
-  sponge[46] = nonce.uint8_t[1];
-  sponge[47] = nonce.uint8_t[2];
-  sponge[48] = nonce.uint8_t[3];
-  sponge[49] = nonce.uint8_t[4];
-  sponge[50] = nonce.uint8_t[5];
-  sponge[51] = nonce.uint8_t[6];
-  sponge[52] = nonce.uint8_t[7];
+    // Copy init code hash
+    #pragma unroll
+    for(int i = 53; i < 85; i++) {
+      sponge[i] = *(&S_53 + (i-53));
+    }
 
-  sponge[53] = S_53;
-  sponge[54] = S_54;
-  sponge[55] = S_55;
-  sponge[56] = S_56;
-  sponge[57] = S_57;
-  sponge[58] = S_58;
-  sponge[59] = S_59;
-  sponge[60] = S_60;
-  sponge[61] = S_61;
-  sponge[62] = S_62;
-  sponge[63] = S_63;
-  sponge[64] = S_64;
-  sponge[65] = S_65;
-  sponge[66] = S_66;
-  sponge[67] = S_67;
-  sponge[68] = S_68;
-  sponge[69] = S_69;
-  sponge[70] = S_70;
-  sponge[71] = S_71;
-  sponge[72] = S_72;
-  sponge[73] = S_73;
-  sponge[74] = S_74;
-  sponge[75] = S_75;
-  sponge[76] = S_76;
-  sponge[77] = S_77;
-  sponge[78] = S_78;
-  sponge[79] = S_79;
-  sponge[80] = S_80;
-  sponge[81] = S_81;
-  sponge[82] = S_82;
-  sponge[83] = S_83;
-  sponge[84] = S_84;
+    // Padding
+    sponge[85] = 0x01u;
+    sponge[135] = 0x80u;
 
-  // begin padding based on message length
-  sponge[85] = 0x01u;
+    // Process hash
+    keccakf(spongeBuffer);
 
-  // fill padding
-#pragma unroll
-  for (int i = 86; i < 135; ++i)
-    sponge[i] = 0;
-
-  // end padding
-  sponge[135] = 0x80u;
-
-  // fill remaining sponge state with zeroes
-#pragma unroll
-  for (int i = 136; i < 200; ++i)
-    sponge[i] = 0;
-
-  // Apply keccakf
-  keccakf(spongeBuffer);
-
-  // determine if the address meets the constraints
-  if (
-    hasLeading(digest) 
-#if TOTAL_ZEROES <= 20
-    || hasTotal(digest)
-#endif
-  ) {
-    // To be honest, if we are using OpenCL, 
-    // we just need to write one solution for all practical purposes,
-    // since the chance of multiple solutions appearing
-    // in a single workset is extremely low.
-    solutions[0] = nonce.uint64_t;
+    // Check result
+    if(check_score(digest, 20)) {
+      atomic_min(&solutions[0], nonce.uint64_t);
+      return;
+    }
   }
 }

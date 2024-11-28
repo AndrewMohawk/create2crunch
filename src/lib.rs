@@ -17,23 +17,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
 use tiny_keccak::{Hasher, Keccak};
 
-mod reward;
-pub use reward::Reward;
+use crate::scoring::score_address_hex;
+mod gpu_config;
+mod patterns;
+mod scoring;
 
 const WORK_SIZE: u32 = 0x80000000;
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
-const PATTERN_BYTES: [[u8; 4]; 8] = [
-    [0x00, 0x44, 0x44, 0x44],  // Direct 444 pattern
-    [0x40, 0x44, 0x40, 0x44],  // Alternating
-    [0x04, 0x44, 0x04, 0x44],  // Alternating with low 4s
-    [0x44, 0x44, 0x44, 0x00],  // Reverse pattern
-    [0x00, 0x00, 0x44, 0x44],  // Leading zeros
-    [0x44, 0x44, 0x00, 0x44],  // Pattern for end 4s
-    [0x00, 0x40, 0x44, 0x44],  // Mixed pattern
-    [0x44, 0x40, 0x44, 0x44],  // Heavy on 4s
-];
+
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 
 pub struct Config {
@@ -65,11 +58,11 @@ impl Config {
         };
         let leading_zeroes_threshold_string = match args.next() {
             Some(arg) => arg,
-            None => String::from("3"),
+            None => String::from("8"),  // Increased minimum leading zeros
         };
         let total_zeroes_threshold_string = match args.next() {
             Some(arg) => arg,
-            None => String::from("5"),
+            None => String::from("8"),  // Increased total zeros threshold
         };
 
         let Ok(factory_address_vec) = hex::decode(factory_address_string) else {
@@ -120,59 +113,8 @@ impl Config {
     }
 }
 
-fn score_address_hex(addr: &str) -> Option<u32> {
-    let addr = addr.trim_start_matches("0x");
-    let mut score = 0;
-    let mut first_non_zero_pos = None;
-    
-    // Count leading zeros and find first non-zero
-    for (i, c) in addr.chars().enumerate() {
-        if c == '0' {
-            if first_non_zero_pos.is_none() {
-                score += 10;
-            }
-        } else {
-            if first_non_zero_pos.is_none() {
-                first_non_zero_pos = Some(i);
-                if c != '4' {
-                    return None;
-                }
-            }
-        }
-    }
-
-    if first_non_zero_pos.is_none() {
-        return None;
-    }
-
-    // Check for 4444 sequence
-    if let Some(pos) = addr.find("4444") {
-        score += 40;  // Base score for four 4s
-        
-        // Safely check next character after 4444 if it exists
-        if pos + 4 < addr.len() {
-            if let Some(next_char) = addr.chars().nth(pos + 4) {
-                if next_char != '4' {
-                    score += 20;
-                }
-            }
-        }
-    }
-
-    // Check last 4 characters
-    if addr.len() >= 4 && addr.ends_with("4444") {
-        score += 20;
-    }
-
-    // Count all 4s
-    score += addr.chars().filter(|&c| c == '4').count() as u32;
-
-    Some(score)
-}
-
 pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
     let file = output_file();
-    //let rewards = Reward::new();
 
     loop {
         let mut header = [0; 47];
@@ -201,7 +143,7 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                 let address_hex = format!("{address}");
 
                 if let Some(score) = score_address_hex(&address_hex) {
-                    if score > 62 {
+                    if score > 174 {  // Only keep competitive scores
                         let header_hex_string = hex::encode(header);
                         let body_hex_string = hex::encode(salt_incremented_segment);
                         let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
@@ -222,6 +164,9 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
 }
 
 pub fn gpu(config: Config) -> ocl::Result<()> {
+    let work_group_size = gpu_config::get_optimal_work_group_size();
+    let optimal_patterns = patterns::get_optimal_pattern_sequence();
+    
     println!(
         "Setting up experimental OpenCL miner using device {}...",
         config.gpu_device
@@ -239,10 +184,14 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
         .platform(platform)
         .devices(device)
         .build()?;
+    
+    // Configure OpenCL for H100 and use it
     let program = Program::builder()
         .devices(device)
         .src(mk_kernel_src(&config))
+        .cmplr_opt(&format!("-cl-std=CL2.0 -D WORKGROUP_SIZE={}", work_group_size))
         .build(&context)?;
+
     let queue = Queue::new(&context, device, None)?;
     let ocl_pq = ProQue::new(context, queue, program, Some(WORK_SIZE));
     let mut rng = thread_rng();
@@ -256,8 +205,8 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     let mut work_duration_millis: u64 = 0;
 
     loop {
-        let current_pattern = PATTERN_BYTES[pattern_index];
-        pattern_index = (pattern_index + 1) % PATTERN_BYTES.len();
+        let current_pattern = optimal_patterns[pattern_index];
+        pattern_index = (pattern_index + 1) % optimal_patterns.len();
 
         let mut pattern = [0u8; 4];
         pattern.copy_from_slice(&current_pattern);
@@ -504,7 +453,7 @@ fn get_score_check_code() -> String {
             if(last_four) score += 20;
         }
         
-        return score > 62;  // Using your new threshold
+        return score > 174;  // Only keep competitive scores
     }
     "#.to_string()
 }
