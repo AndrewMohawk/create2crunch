@@ -471,10 +471,29 @@ fn mk_kernel_src(config: &Config) -> String {
     let factory = config.factory_address.iter();
     let caller = config.calling_address.iter();
     let hash = config.init_code_hash.iter();
-    let hash = hash.enumerate().map(|(i, x)| (i + 52, x));
-    for (i, x) in factory.chain(caller).enumerate().chain(hash) {
-        writeln!(src, "#define S_{} {}u", i + 1, x).unwrap();
+    
+    // Generate array definitions for the constants
+    writeln!(src, "__constant uchar factory_address[20] = {{").unwrap();
+    for (i, x) in factory.enumerate() {
+        if i > 0 { write!(src, ", ").unwrap(); }
+        write!(src, "0x{:02x}u", x).unwrap();
     }
+    writeln!(src, "}};").unwrap();
+    
+    writeln!(src, "__constant uchar caller_address[20] = {{").unwrap();
+    for (i, x) in caller.enumerate() {
+        if i > 0 { write!(src, ", ").unwrap(); }
+        write!(src, "0x{:02x}u", x).unwrap();
+    }
+    writeln!(src, "}};").unwrap();
+    
+    writeln!(src, "__constant uchar init_code_hash[32] = {{").unwrap();
+    for (i, x) in hash.enumerate() {
+        if i > 0 { write!(src, ", ").unwrap(); }
+        write!(src, "0x{:02x}u", x).unwrap();
+    }
+    writeln!(src, "}};").unwrap();
+    
     let lz = config.leading_zeroes_threshold;
     writeln!(src, "#define LEADING_ZEROES {lz}").unwrap();
     let tz = config.total_zeroes_threshold;

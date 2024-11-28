@@ -252,7 +252,7 @@ __kernel void hashMessage(
     // Copy factory and caller address
     #pragma unroll
     for(int i = 1; i < 41; i++) {
-      sponge[i] = S_##i;
+      sponge[i] = (i <= 20) ? factory_address[i-1] : caller_address[i-21];
     }
 
     // Copy message pattern
@@ -274,7 +274,7 @@ __kernel void hashMessage(
     // Copy init code hash
     #pragma unroll
     for(int i = 53; i < 85; i++) {
-      sponge[i] = S_##i;
+      sponge[i] = init_code_hash[i-53];
     }
 
     // Padding
