@@ -228,7 +228,7 @@ __kernel void hashMessage(
   __constant uint const *d_nonce,
   __global volatile ulong *restrict solutions
 ) {
-  __local ulong shared_sponge[64][25];
+  __local ulong shared_sponge[32][25]; // Reduced shared memory usage
   const uint gid = get_global_id(0);
   const uint lid = get_local_id(0);
   
@@ -237,15 +237,14 @@ __kernel void hashMessage(
 #define digest (sponge + 12)
 
   // Process multiple hashes per thread
-  #pragma unroll 4
-  for(uint batch = 0; batch < 4; batch++) {
-    uint current_nonce = gid * 4 + batch;
+  #pragma unroll 16
+  for(uint batch = 0; batch < 16; batch++) {
+    uint current_nonce = gid * 16 + batch;
     
     // Initialize sponge state
-    #pragma unroll 8 
+    #pragma unroll 16
     for(int i = 0; i < 200; i += 8) {
       vstore8(0UL, 0, &sponge[i]);
-    }
 
     // Set control character
     sponge[0] = 0xffu;

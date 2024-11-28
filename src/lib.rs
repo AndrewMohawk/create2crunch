@@ -189,14 +189,22 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     let program = Program::builder()
         .devices(device)
         .src(mk_kernel_src(&config))
-        .cmplr_opt(&format!("-cl-std=CL2.0 -D WORKGROUP_SIZE={} -D TOTAL_ZEROES={} -D LEADING_ZEROES={}", 
+        .cmplr_opt(&format!(
+            "-cl-std=CL2.0 -D WORKGROUP_SIZE={} -D TOTAL_ZEROES={} -D LEADING_ZEROES={} \
+             -cl-mad-enable -cl-fast-relaxed-math -cl-no-signed-zeros \
+             -cl-denorms-are-zero -cl-single-precision-constant",
             work_group_size,
             config.total_zeroes_threshold,
-            config.leading_zeroes_threshold))
+            config.leading_zeroes_threshold
+        ))
         .build(&context)?;
 
     let queue = Queue::new(&context, device, None)?;
-    let ocl_pq = ProQue::new(context, queue, program, Some(WORK_SIZE));
+    let mut builder = ProQue::builder();
+    builder.prog_bldr(program);
+    builder.queue(queue);
+    builder.dims(WORK_SIZE / 16); // Process 16 hashes per thread for better occupancy
+    let ocl_pq = builder.build()?;
     let mut rng = thread_rng();
     let start_time: f64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
