@@ -500,7 +500,7 @@ fn output_file() -> File {
 fn get_score_check_code() -> String {
     r#"
     #define ADDR_LEN 20
-    #define SCORE_THRESHOLD 85 (prev high score)
+    #define SCORE_THRESHOLD 85
     
     // Precompute lookup table for nibble counting
     __constant uchar nibble_is_four[16] = {0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0};
