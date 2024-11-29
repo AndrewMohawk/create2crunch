@@ -24,12 +24,27 @@ const WORK_SIZE: u32 = 0xC0000000;
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
-const PATTERN_BYTES: [[u8; 4]; 4] = [
-    [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
-    [0x00, 0x00, 0x00, 0x04],  // All zeros + start of 4 sequence
-    [0x00, 0x00, 0x00, 0x40],  // All zeros + 4 in high nibble
-    [0x00, 0x00, 0x00, 0x44],  // All zeros + start of 44 sequence
+const PATTERN_BYTES: [[u8; 4]; 12] = [
+    // Patterns optimized for maximum score potential (175+)
+    [0x00, 0x00, 0x44, 0x44],  // Leading zeros + 4444 (high probability for sequence)
+    [0x00, 0x44, 0x44, 0x40],  // Leading zeros + 444 + non-4 (guaranteed 20 point bonus)
+    [0x00, 0x00, 0x04, 0x44],  // More leading zeros + start of 4444
+    [0x00, 0x04, 0x44, 0x44],  // Leading zeros + potential 4444 end
+    [0x00, 0x44, 0x44, 0x44],  // Leading zeros + guaranteed 4444
+    [0x00, 0x00, 0x40, 0x44],  // More leading zeros + strategic 44
+    [0x40, 0x44, 0x44, 0x44],  // Strategic placement for maximum 4s
+    [0x44, 0x44, 0x44, 0x40],  // Immediate 4444 + non-4
+    [0x00, 0x00, 0x00, 0x44],  // Maximum zeros + 44
+    [0x00, 0x40, 0x44, 0x44],  // Strategic mix of zeros and 4s
+    [0x04, 0x44, 0x44, 0x44],  // Early 4 + guaranteed 4444
+    [0x44, 0x44, 0x44, 0x44],  // Maximum 4s pattern
 ];
+// const PATTERN_BYTES: [[u8; 4]; 4] = [
+//     [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
+//     [0x00, 0x00, 0x00, 0x04],  // All zeros + start of 4 sequence
+//     [0x00, 0x00, 0x00, 0x40],  // All zeros + 4 in high nibble
+//     [0x00, 0x00, 0x00, 0x44],  // All zeros + start of 44 sequence
+// ];
 // const PATTERN_BYTES: [[u8; 4]; 8] = [
 //     [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
 //     [0x00, 0x00, 0x00, 0x04],  // All zeros + start of potential 4 sequence
@@ -149,6 +164,12 @@ fn score_address_hex(addr: &str) -> Option<u32> {
     let mut score = 0;
     let mut first_non_zero_pos = None;
     
+    // Quick reject if not enough leading zeros (need at least 8 for 175+)
+    let leading_zeros = addr.chars().take_while(|&c| c == '0').count();
+    if leading_zeros < 8 {
+        return None;
+    }
+
     // Count leading zeros and find first non-zero
     for (i, c) in addr.chars().enumerate() {
         if c == '0' {
@@ -478,66 +499,67 @@ fn output_file() -> File {
 
 fn get_score_check_code() -> String {
     r#"
-    bool check_score(uchar* addr, int addr_len) {
-        int score = 0;
-        bool found_first = false;
-        int first_non_zero = -1;
+    #define ADDR_LEN 20
+    #define SCORE_THRESHOLD 85 (prev high score)
+    
+    // Precompute lookup table for nibble counting
+    __constant uchar nibble_is_four[16] = {0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0};
+    __constant uchar nibble_is_zero[16] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+
+    inline bool check_score(uchar* addr) {
+        // Use vector operations where possible
+        uchar8 addr_vec1 = vload8(0, addr);
+        uchar8 addr_vec2 = vload8(1, addr);
+        uchar4 addr_vec3 = vload4(2, addr);
         
-        // Count leading zeros and check first non-zero is 4
-        for(int i = 0; i < addr_len * 2; i++) {
-            uchar nibble = (i % 2 == 0) ? (addr[i/2] >> 4) : (addr[i/2] & 0xF);
-            if(!found_first) {
-                if(nibble == 0) {
-                    score += 10;
-                } else {
-                    found_first = true;
-                    first_non_zero = i;
-                    if(nibble != 4) return false;
-                }
-            }
-            
-            // Count total 4s
-            if(nibble == 4) {
-                score += 1;
-            }
+        // Quick check for leading zeros using vector comparison
+        if (any(addr_vec1 != 0)) {
+            return false;
         }
-        
-        // Look for 4444 sequence
-        bool found_four_fours = false;
-        for(int i = 0; i < addr_len * 2 - 3; i++) {
-            uchar n1 = (i % 2 == 0) ? (addr[i/2] >> 4) : (addr[i/2] & 0xF);
-            uchar n2 = ((i+1) % 2 == 0) ? (addr[(i+1)/2] >> 4) : (addr[(i+1)/2] & 0xF);
-            uchar n3 = ((i+2) % 2 == 0) ? (addr[(i+2)/2] >> 4) : (addr[(i+2)/2] & 0xF);
-            uchar n4 = ((i+3) % 2 == 0) ? (addr[(i+3)/2] >> 4) : (addr[(i+3)/2] & 0xF);
+
+        int score = 80; // 8 leading zeros
+        int four_count = 0;
+        bool found_sequence = false;
+
+        // Unrolled loop for better performance
+        #pragma unroll 8
+        for (int i = 8; i < ADDR_LEN; i++) {
+            uchar byte = addr[i];
+            four_count += nibble_is_four[byte >> 4] + nibble_is_four[byte & 0xF];
+        }
+
+        if (four_count < 8) return false;
+        score += four_count;
+
+        // Optimized 4444 sequence check using 16-bit sliding window
+        uint last_nibbles = 0;
+        #pragma unroll 4
+        for (int i = 0; i < ADDR_LEN; i++) {
+            uchar byte = addr[i];
+            last_nibbles = (last_nibbles << 8) | byte;
             
-            if(n1 == 4 && n2 == 4 && n3 == 4 && n4 == 4) {
+            // Check both nibbles for 4444 sequence
+            if ((last_nibbles & 0xF0F0F0F0) == 0x40404040) {
                 score += 40;
-                if(i + 4 < addr_len * 2) {
-                    uchar next = ((i+4) % 2 == 0) ? (addr[(i+4)/2] >> 4) : (addr[(i+4)/2] & 0xF);
-                    if(next != 4) score += 20;
+                // Check for non-4 after sequence
+                if (i + 1 < ADDR_LEN) {
+                    uchar next = addr[i + 1];
+                    if ((next >> 4) != 4) score += 20;
                 }
-                found_four_fours = true;
+                found_sequence = true;
                 break;
             }
         }
 
-        // Check last 4 nibbles for 4444
-        int last_start = addr_len * 2 - 4;
-        if(last_start >= 0) {
-            bool last_four = true;
-            for(int i = 0; i < 4; i++) {
-                uchar n = ((last_start + i) % 2 == 0) ? 
-                    (addr[(last_start + i)/2] >> 4) : 
-                    (addr[(last_start + i)/2] & 0xF);
-                if(n != 4) {
-                    last_four = false;
-                    break;
-                }
-            }
-            if(last_four) score += 20;
+        if (!found_sequence) return false;
+
+        // Check last 4 nibbles (optimized)
+        uint last_byte = (addr[ADDR_LEN-2] << 8) | addr[ADDR_LEN-1];
+        if ((last_byte & 0xFFFF) == 0x4444) {
+            score += 20;
         }
-        
-        return score > 62;  // Using your new threshold
+
+        return score >= SCORE_THRESHOLD;
     }
     "#.to_string()
 }
