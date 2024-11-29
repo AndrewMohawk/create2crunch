@@ -1,7 +1,16 @@
 use rustc_hash::FxHashMap;
 
+#[derive(Debug, Clone, Copy)]
+pub enum PatternType {
+    LeadingZeros,    // 10 points each
+    FourSequence,    // 40 points for 4444
+    NonFourAfter,    // 20 points for non-4 after 4444
+    LastFourFours,   // 20 points for ending in 4444
+}
+
 pub struct Reward {
     reward: FxHashMap<usize, &'static str>,
+    optimal_patterns: Vec<(PatternType, u32)>, // (pattern_type, min_score_needed)
 }
 
 impl Reward {
@@ -208,11 +217,96 @@ impl Reward {
             (399, "340282366920938463463374607431768211456"),
             (420, "87112285931760246646623899502532662132736"),
         ]);
-        Reward { reward }
+        // Define optimal scoring patterns and their minimum scores needed
+        let optimal_patterns = vec![
+            (PatternType::LeadingZeros, 110),
+            (PatternType::FourSequence, 40),
+            (PatternType::NonFourAfter, 20),
+            (PatternType::LastFourFours, 20),
+        ];
+
+        Reward { reward, optimal_patterns }
+        
     }
 
     #[inline]
     pub fn get(&self, value: &usize) -> Option<&'static str> {
         self.reward.get(value).copied()
+    }
+
+    #[inline]
+    pub fn analyze_pattern(&self, bytes: &[u8]) -> u32 {
+        let mut score: u32 = 0;
+        let mut found_first_non_zero = false;
+        let mut consecutive_fours = 0;
+        let mut has_four_sequence = false;
+        let mut four_count = 0;
+
+        let nibbles: Vec<u8> = bytes.iter().flat_map(|&byte| {
+            vec![(byte >> 4) & 0xF, byte & 0xF]
+        }).collect();
+
+        for (i, &nibble) in nibbles.iter().enumerate() {
+            if !found_first_non_zero {
+                if nibble == 0 {
+                    score += 10;
+                } else {
+                    found_first_non_zero = true;
+                    if nibble != 4 {
+                        return 0;
+                    }
+                }
+            }
+
+            if nibble == 4 {
+                four_count += 1;
+                consecutive_fours += 1;
+                if consecutive_fours == 4 && !has_four_sequence {
+                    has_four_sequence = true;
+                    score += 40;
+                    
+                    if i + 1 < nibbles.len() && nibbles[i + 1] != 4 {
+                        score += 20;
+                    }
+                }
+            } else {
+                consecutive_fours = 0;
+            }
+        }
+
+        if nibbles.len() >= 4 {
+            let last_four = &nibbles[nibbles.len() - 4..];
+            if last_four.iter().all(|&x| x == 4) {
+                score += 20;
+            }
+        }
+
+        score += four_count;
+
+        score
+    }
+
+    #[inline]
+    pub fn is_worth_mining(&self, pattern: &[u8]) -> bool {
+        let score = self.analyze_pattern(pattern);
+        
+        if score > 174 {
+            return true;
+        }
+
+        let leading_zeros = (pattern.iter().take_while(|&&b| b == 0).count() * 2) as u32;
+        let potential_score = score + 
+            (leading_zeros * 10) +     // Points from leading zeros
+            40u32 +                    // Potential 4444 sequence
+            20u32 +                    // Potential non-4 after sequence
+            20u32 +                    // Potential last four 4s
+            15u32;                     // Reasonable number of additional 4s
+
+        potential_score > 174
+    }
+
+    #[inline]
+    pub fn get_optimal_patterns(&self) -> &[(PatternType, u32)] {
+        &self.optimal_patterns
     }
 }
