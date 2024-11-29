@@ -507,44 +507,73 @@ fn get_score_check_code() -> String {
     __constant uchar nibble_is_zero[16] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
     inline bool check_score(uchar* addr) {
-        // Use vector operations where possible
-        uchar8 addr_vec1 = vload8(0, addr);
-        uchar8 addr_vec2 = vload8(1, addr);
-        uchar4 addr_vec3 = vload4(2, addr);
-        
-        // Quick check for leading zeros using vector comparison
-        if (any(addr_vec1 != 0)) {
-            return false;
+        // Quick check first 8 bytes (16 nibbles) for zeros
+        for (int i = 0; i < 8; i++) {
+            if (addr[i] != 0) return false;
         }
 
         int score = 80; // 8 leading zeros
         int four_count = 0;
         bool found_sequence = false;
-
-        // Unrolled loop for better performance
-        #pragma unroll 8
+        bool found_first = false;
+        
+        // Process remaining bytes
         for (int i = 8; i < ADDR_LEN; i++) {
             uchar byte = addr[i];
-            four_count += nibble_is_four[byte >> 4] + nibble_is_four[byte & 0xF];
+            uchar high = byte >> 4;
+            uchar low = byte & 0xF;
+            
+            // Check first non-zero must be 4
+            if (!found_first) {
+                if (high != 0) {
+                    if (high != 4) return false;
+                    found_first = true;
+                }
+            }
+            if (high == 4) four_count++;
+            
+            if (!found_first) {
+                if (low != 0) {
+                    if (low != 4) return false;
+                    found_first = true;
+                }
+            }
+            if (low == 4) four_count++;
         }
 
         if (four_count < 8) return false;
         score += four_count;
 
-        // Optimized 4444 sequence check using 16-bit sliding window
-        uint last_nibbles = 0;
-        #pragma unroll 4
-        for (int i = 0; i < ADDR_LEN; i++) {
-            uchar byte = addr[i];
-            last_nibbles = (last_nibbles << 8) | byte;
+        // Check for 4444 sequence using sliding window
+        for (int i = 0; i < ADDR_LEN - 2; i++) {
+            // Check if we have four 4s in a row
+            int pos = i * 2;  // Position in nibbles
+            int count = 0;
             
-            // Check both nibbles for 4444 sequence
-            if ((last_nibbles & 0xF0F0F0F0) == 0x40404040) {
+            for (int j = 0; j < 4; j++) {
+                int curr_pos = pos + j;
+                uchar nibble;
+                if (curr_pos % 2 == 0) {
+                    nibble = addr[curr_pos/2] >> 4;
+                } else {
+                    nibble = addr[curr_pos/2] & 0xF;
+                }
+                if (nibble == 4) count++;
+                else break;
+            }
+            
+            if (count == 4) {
                 score += 40;
-                // Check for non-4 after sequence
-                if (i + 1 < ADDR_LEN) {
-                    uchar next = addr[i + 1];
-                    if ((next >> 4) != 4) score += 20;
+                // Check next nibble after sequence
+                int next_pos = pos + 4;
+                if (next_pos < ADDR_LEN * 2) {
+                    uchar next_nibble;
+                    if (next_pos % 2 == 0) {
+                        next_nibble = addr[next_pos/2] >> 4;
+                    } else {
+                        next_nibble = addr[next_pos/2] & 0xF;
+                    }
+                    if (next_nibble != 4) score += 20;
                 }
                 found_sequence = true;
                 break;
@@ -553,11 +582,22 @@ fn get_score_check_code() -> String {
 
         if (!found_sequence) return false;
 
-        // Check last 4 nibbles (optimized)
-        uint last_byte = (addr[ADDR_LEN-2] << 8) | addr[ADDR_LEN-1];
-        if ((last_byte & 0xFFFF) == 0x4444) {
-            score += 20;
+        // Check last 4 nibbles
+        bool last_four = true;
+        for (int i = 0; i < 4; i++) {
+            int pos = (ADDR_LEN * 2) - 4 + i;
+            uchar nibble;
+            if (pos % 2 == 0) {
+                nibble = addr[pos/2] >> 4;
+            } else {
+                nibble = addr[pos/2] & 0xF;
+            }
+            if (nibble != 4) {
+                last_four = false;
+                break;
+            }
         }
+        if (last_four) score += 20;
 
         return score >= SCORE_THRESHOLD;
     }
