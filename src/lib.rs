@@ -153,43 +153,44 @@ fn score_address_hex(addr: &str) -> Option<u32> {
     for (i, c) in addr.chars().enumerate() {
         if c == '0' {
             if first_non_zero_pos.is_none() {
-                score += 10;
+                score += 10;  // Correct: 10 points per leading zero
             }
         } else {
             if first_non_zero_pos.is_none() {
                 first_non_zero_pos = Some(i);
                 if c != '4' {
-                    return None;
+                    return None;  // Correct: First non-zero must be 4
                 }
             }
         }
     }
 
+    // Return None if the address is all zeros
     if first_non_zero_pos.is_none() {
         return None;
     }
 
-    // Check for 4444 sequence
+    // Count all 4s first (1 point each)
+    score += addr.chars().filter(|&c| c == '4').count() as u32;
+
+    // Check for 4444 sequence (40 points) and non-4 after (20 points)
     if let Some(pos) = addr.find("4444") {
         score += 40;  // Base score for four 4s
         
-        // Safely check next character after 4444 if it exists
+        // Check for non-4 after sequence
         if pos + 4 < addr.len() {
             if let Some(next_char) = addr.chars().nth(pos + 4) {
                 if next_char != '4' {
-                    score += 20;
+                    score += 20;  // Bonus for non-4 after sequence
                 }
             }
         }
     }
 
-    // Check last 4 characters
+    // Check last 4 characters for 4444 (20 points)
     if addr.len() >= 4 && addr.ends_with("4444") {
         score += 20;
     }
-
-    // Count all 4s
-    score += addr.chars().filter(|&c| c == '4').count() as u32;
 
     Some(score)
 }
@@ -225,7 +226,7 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                 let address_hex = format!("{address}");
 
                 if let Some(score) = score_address_hex(&address_hex) {
-                    if score > 62 {
+                    if score > 174 {
                         let header_hex_string = hex::encode(header);
                         let body_hex_string = hex::encode(salt_incremented_segment);
                         let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
@@ -255,6 +256,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
     let file = output_file();
     let mut found: u64 = 0;
+    let mut highest_score: u32 = 0;
     let mut found_list: Vec<String> = vec![];
     let term = Term::stdout();
     let platform = Platform::new(ocl::core::default_platform()?);
@@ -359,9 +361,10 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
                 term.write_line(&format!(
                     "rate: {:.2} million attempts per second\t\t\t\
-                     total found this run: {}",
+                     total found: {} (highest score: {})",
                     work_rate as f64 * rate,
-                    found
+                    found,
+                    highest_score
                 ))?;
 
                 term.write_line(&format!(
@@ -433,18 +436,24 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             let address_hex = format!("{}", address);
 
             if let Some(score) = score_address_hex(&address_hex) {
-                if score > 174 {
+                if score > 174 || score > highest_score {
                     found += 1;
+                    let is_new_high_score = score > highest_score;
+                    highest_score = highest_score.max(score);
+                    
                     let output = format!(
-                        "0x{}{}{} => {} => {}",
+                        "0x{}{}{} => {} => {}{}",
                         hex::encode(config.calling_address),
                         hex::encode(salt),
                         hex::encode(solution),
                         address,
-                        score
+                        score,
+                        if is_new_high_score { " (NEW HIGH SCORE)" } else { "" }
                     );
 
-                    let show = format!("{output} (Score: {score})");
+                    let show = format!("{output} (Score: {score}{})", 
+                        if is_new_high_score { " - NEW HIGH SCORE!" } else { "" }
+                    );
                     found_list.push(show.to_string());
 
                     file.lock_exclusive().expect("Couldn't lock file.");
