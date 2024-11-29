@@ -24,16 +24,22 @@ const WORK_SIZE: u32 = 0xC0000000;
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
-const PATTERN_BYTES: [[u8; 4]; 8] = [
+const PATTERN_BYTES: [[u8; 4]; 4] = [
     [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
-    [0x00, 0x00, 0x00, 0x04],  // All zeros + start of potential 4 sequence
+    [0x00, 0x00, 0x00, 0x04],  // All zeros + start of 4 sequence
     [0x00, 0x00, 0x00, 0x40],  // All zeros + 4 in high nibble
-    [0x00, 0x00, 0x04, 0x00],  // All zeros with strategic 4
-    [0x00, 0x00, 0x04, 0x40],  // All zeros with 4 pattern
-    [0x00, 0x00, 0x04, 0x44],  // All zeros leading to 444
-    [0x00, 0x00, 0x40, 0x44],  // All zeros with 44 end
-    [0x00, 0x00, 0x44, 0x44],  // All zeros with 4444 potential
+    [0x00, 0x00, 0x00, 0x44],  // All zeros + start of 44 sequence
 ];
+// const PATTERN_BYTES: [[u8; 4]; 8] = [
+//     [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
+//     [0x00, 0x00, 0x00, 0x04],  // All zeros + start of potential 4 sequence
+//     [0x00, 0x00, 0x00, 0x40],  // All zeros + 4 in high nibble
+//     [0x00, 0x00, 0x04, 0x00],  // All zeros with strategic 4
+//     [0x00, 0x00, 0x04, 0x40],  // All zeros with 4 pattern
+//     [0x00, 0x00, 0x04, 0x44],  // All zeros leading to 444
+//     [0x00, 0x00, 0x40, 0x44],  // All zeros with 44 end
+//     [0x00, 0x00, 0x44, 0x44],  // All zeros with 4444 potential
+// ];
 // const PATTERN_BYTES: [[u8; 4]; 16] = [
 //     [0x00, 0x00, 0x00, 0x00],  // All zeros to maximize leading zeros
 //     [0x00, 0x00, 0x00, 0x44],  // Leading zeros + start of 4 sequence
