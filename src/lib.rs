@@ -2,7 +2,9 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 
 use alloy_primitives::{hex, Address, FixedBytes};
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
+//use byteorder::{BigEndian, ByteOrder, LittleEndian};
+//use byteorder::{LittleEndian, WriteBytesExt,BigEndian};
+use byteorder::{LittleEndian, WriteBytesExt};
 use console::Term;
 use fs4::FileExt;
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
@@ -20,54 +22,24 @@ use tiny_keccak::{Hasher, Keccak};
 mod reward;
 pub use reward::Reward;
 
-const WORK_SIZE: u32 = 0xC0000000;
+// workset size (tweak this!)
+const WORK_SIZE: u32 = 0x4000000; // max. 0x15400000 to abs. max 0xffffffff
+
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
-const PATTERN_BYTES: [[u8; 4]; 6] = [
-    [0x00, 0x00, 0x00, 0x00],  // All zeros for maximum leading zeros
-    [0x00, 0x00, 0x00, 0x04],  // All zeros with trailing 4
-    [0x00, 0x00, 0x00, 0x40],  // All zeros with 4 in high nibble
-    [0x00, 0x00, 0x00, 0x44],  // All zeros with 44
-    [0x00, 0x00, 0x04, 0x44],  // Nearly all zeros with 444
-    [0x00, 0x00, 0x44, 0x44],  // Zeros with 4444
-];
-// const PATTERN_BYTES: [[u8; 4]; 4] = [
-//     [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
-//     [0x00, 0x00, 0x00, 0x04],  // All zeros + start of 4 sequence
-//     [0x00, 0x00, 0x00, 0x40],  // All zeros + 4 in high nibble
-//     [0x00, 0x00, 0x00, 0x44],  // All zeros + start of 44 sequence
-// ];
-// const PATTERN_BYTES: [[u8; 4]; 8] = [
-//     [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
-//     [0x00, 0x00, 0x00, 0x04],  // All zeros + start of potential 4 sequence
-//     [0x00, 0x00, 0x00, 0x40],  // All zeros + 4 in high nibble
-//     [0x00, 0x00, 0x04, 0x00],  // All zeros with strategic 4
-//     [0x00, 0x00, 0x04, 0x40],  // All zeros with 4 pattern
-//     [0x00, 0x00, 0x04, 0x44],  // All zeros leading to 444
-//     [0x00, 0x00, 0x40, 0x44],  // All zeros with 44 end
-//     [0x00, 0x00, 0x44, 0x44],  // All zeros with 4444 potential
-// ];
-// const PATTERN_BYTES: [[u8; 4]; 16] = [
-//     [0x00, 0x00, 0x00, 0x00],  // All zeros to maximize leading zeros
-//     [0x00, 0x00, 0x00, 0x44],  // Leading zeros + start of 4 sequence
-//     [0x00, 0x00, 0x44, 0x44],  // Leading zeros + 4444
-//     [0x00, 0x44, 0x44, 0x40],  // Leading zeros + 4444 + non-4
-//     [0x00, 0x00, 0x04, 0x44],  // Alternative leading zeros pattern
-//     [0x00, 0x04, 0x44, 0x44],  // Another leading zeros variant
-//     [0x00, 0x00, 0x00, 0x04],  // Maximum leading zeros with 4
-//     [0x00, 0x00, 0x40, 0x44],  // Leading zeros with strategic 4s
-//     [0x00, 0x00, 0x44, 0x40],  // Leading zeros with 44 pattern
-//     [0x00, 0x44, 0x40, 0x44],  // Mixed pattern with leading zero
-//     [0x00, 0x00, 0x00, 0x40],  // Many leading zeros + 4
-//     [0x00, 0x00, 0x04, 0x40],  // Leading zeros + strategic 4s
-//     [0x00, 0x04, 0x40, 0x44],  // Another strategic pattern
-//     [0x00, 0x00, 0x44, 0x04],  // Leading zeros + 44 variant
-//     [0x00, 0x04, 0x44, 0x40],  // Leading zeros + 444 + non-4
-//     [0x00, 0x00, 0x40, 0x40],  // Leading zeros + spaced 4s
-// ];
+
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 
+/// Requires three hex-encoded arguments: the address of the contract that will
+/// be calling CREATE2, the address of the caller of said contract *(assuming
+/// the contract calling CREATE2 has frontrunning protection in place - if not
+/// applicable to your use-case you can set it to the null address)*, and the
+/// keccak-256 hash of the bytecode that is provided by the contract calling
+/// CREATE2 that will be used to initialize the new contract. An additional set
+/// of three optional values may be provided: a device to target for OpenCL GPU
+/// search, a threshold for leading zeroes to search for, and a threshold for
+/// total zeroes to search for.
 pub struct Config {
     pub factory_address: [u8; 20],
     pub calling_address: [u8; 20],
@@ -77,8 +49,10 @@ pub struct Config {
     pub total_zeroes_threshold: u8,
 }
 
+/// Validate the provided arguments and construct the Config struct.
 impl Config {
     pub fn new(mut args: std::env::Args) -> Result<Self, &'static str> {
+        // get args, skipping first arg (program name)
         args.next();
 
         let Some(factory_address_string) = args.next() else {
@@ -93,7 +67,7 @@ impl Config {
 
         let gpu_device_string = match args.next() {
             Some(arg) => arg,
-            None => String::from("255"),
+            None => String::from("255"), // indicates that CPU will be used.
         };
         let leading_zeroes_threshold_string = match args.next() {
             Some(arg) => arg,
@@ -104,6 +78,7 @@ impl Config {
             None => String::from("5"),
         };
 
+        // convert main arguments from hex string to vector of bytes
         let Ok(factory_address_vec) = hex::decode(factory_address_string) else {
             return Err("could not decode factory address argument");
         };
@@ -114,6 +89,7 @@ impl Config {
             return Err("could not decode initialization code hash argument");
         };
 
+        // convert from vector to fixed array
         let Ok(factory_address) = factory_address_vec.try_into() else {
             return Err("invalid length for factory address argument");
         };
@@ -124,6 +100,7 @@ impl Config {
             return Err("invalid length for initialization code hash argument");
         };
 
+        // convert gpu arguments to u8 values
         let Ok(gpu_device) = gpu_device_string.parse::<u8>() else {
             return Err("invalid gpu device value");
         };
@@ -152,157 +129,83 @@ impl Config {
     }
 }
 
-fn score_address_hex(addr: &str) -> Option<u32> {
-    let addr = addr.trim_start_matches("0x");
-    let mut score = 0;
-    let mut first_non_zero_pos = None;
-    
-    // Quick reject if not enough leading zeros (need at least 8 for 175+)
-    let leading_zeros = addr.chars().take_while(|&c| c == '0').count();
-    if leading_zeros < 8 {
-        return None;
-    }
-
-    // Count leading zeros and find first non-zero
-    for (i, c) in addr.chars().enumerate() {
-        if c == '0' {
-            if first_non_zero_pos.is_none() {
-                score += 10;  // Correct: 10 points per leading zero
-            }
-        } else {
-            if first_non_zero_pos.is_none() {
-                first_non_zero_pos = Some(i);
-                if c != '4' {
-                    return None;  // Correct: First non-zero must be 4
-                }
-            }
-        }
-    }
-
-    // Return None if the address is all zeros
-    if first_non_zero_pos.is_none() {
-        return None;
-    }
-
-    // Count all 4s first (1 point each)
-    score += addr.chars().filter(|&c| c == '4').count() as u32;
-
-    // Check for 4444 sequence (40 points) and non-4 after (20 points)
-    if let Some(pos) = addr.find("4444") {
-        score += 40;  // Base score for four 4s
-        
-        // Check for non-4 after sequence
-        if pos + 4 < addr.len() {
-            if let Some(next_char) = addr.chars().nth(pos + 4) {
-                if next_char != '4' {
-                    score += 20;  // Bonus for non-4 after sequence
-                }
-            }
-        }
-    }
-
-    // Check last 4 characters for 4444 (20 points)
-    if addr.len() >= 4 && addr.ends_with("4444") {
-        score += 20;
-    }
-
-    Some(score)
-}
-
-pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
-    let file = output_file();
-    //let rewards = Reward::new();
-
-    loop {
-        let mut header = [0; 47];
-        header[0] = CONTROL_CHARACTER;
-        header[1..21].copy_from_slice(&config.factory_address);
-        header[21..41].copy_from_slice(&config.calling_address);
-        header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
-
-        let mut hash_header = Keccak::v256();
-        hash_header.update(&header);
-
-        (0..MAX_INCREMENTER)
-            .into_par_iter()
-            .for_each(|salt| {
-                let salt = salt.to_le_bytes();
-                let salt_incremented_segment = &salt[..6];
-
-                let mut hash = hash_header.clone();
-                hash.update(salt_incremented_segment);
-                hash.update(&config.init_code_hash);
-
-                let mut res: [u8; 32] = [0; 32];
-                hash.finalize(&mut res);
-
-                let address = <&Address>::try_from(&res[12..]).unwrap();
-                let address_hex = format!("{address}");
-
-                if let Some(score) = score_address_hex(&address_hex) {
-                    if score > 174 {
-                        let header_hex_string = hex::encode(header);
-                        let body_hex_string = hex::encode(salt_incremented_segment);
-                        let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
-
-                        let output = format!(
-                            "{full_salt} => {address} => {score}"
-                        );
-                        println!("{output}");
-
-                        file.lock_exclusive().expect("Couldn't lock file.");
-                        writeln!(&file, "{output}")
-                            .expect("Couldn't write to `efficient_addresses.txt` file.");
-                        file.unlock().expect("Couldn't unlock file.");
-                    }
-                }
-            });
-    }
-}
+/// Given a Config object with a factory address, a caller address, a keccak-256
+/// hash of the contract initialization code, and a device ID, search for salts
+/// using OpenCL that will enable the factory contract to deploy a contract to a
+/// gas-efficient address via CREATE2. This method also takes threshold values
+/// for both leading zero bytes and total zero bytes - any address that does not
+/// meet or exceed the threshold will not be returned. Default threshold values
+/// are three leading zeroes or five total zeroes.
+///
+/// The 32-byte salt is constructed as follows:
+///   - the 20-byte calling address (to prevent frontrunning)
+///   - a random 4-byte segment (to prevent collisions with other runs)
+///   - a 4-byte segment unique to each work group running in parallel
+///   - a 4-byte nonce segment (incrementally stepped through during the run)
+///
+/// When a salt that will result in the creation of a gas-efficient contract
+/// address is found, it will be appended to `efficient_addresses.txt` along
+/// with the resultant address and the "value" (i.e. approximate rarity) of the
+/// resultant address.
+///
+/// This method is still highly experimental and could almost certainly use
+/// further optimization - contributions are more than welcome!
 
 pub fn gpu(config: Config) -> ocl::Result<()> {
     println!(
         "Setting up experimental OpenCL miner using device {}...",
         config.gpu_device
     );
-    println!("Starting pattern-based mining...");
-    let mut pattern_index: usize = 0;
 
-    let file = output_file();
-    let mut found: u64 = 0;
-    let mut highest_score: u32 = 0;
-    let mut found_list: Vec<String> = vec![];
-    let term = Term::stdout();
+    // (create if necessary) and open a file where found salts will be written
+    let _file = output_file(); // Use `_file` if not used to suppress warning
+
+    // create object for computing rewards (relative rarity) for a given address
+    let _rewards = Reward::new(); // Use `_rewards` if not used to suppress warning
+
+    // track how many addresses have been found and information about them
+    let mut _found: u64 = 0; // Use `_found` if not used to suppress warning
+    let mut _found_list: Vec<String> = vec![]; // Use `_found_list` if not used to suppress warning
+
+    // set up a controller for terminal output
+    let _term = Term::stdout(); // Use `_term` if not used to suppress warning
+
+    // set up a platform to use
     let platform = Platform::new(ocl::core::default_platform()?);
+
+    // set up the device to use
     let device = Device::by_idx_wrap(platform, config.gpu_device as usize)?;
+
+    // set up the context to use
     let context = Context::builder()
         .platform(platform)
         .devices(device)
         .build()?;
+
+    // set up the program to use
     let program = Program::builder()
         .devices(device)
         .src(mk_kernel_src(&config))
         .build(&context)?;
+
+    // set up the queue to use
     let queue = Queue::new(&context, device, None)?;
+
+    // set up the "proqueue" (or amalgamation of various elements) to use
     let ocl_pq = ProQue::new(context, queue, program, Some(WORK_SIZE));
+
+    // create a random number generator
     let mut rng = thread_rng();
-    let start_time: f64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
-    let mut rate: f64 = 0.0;
-    let mut cumulative_nonce: u64 = 0;
-    let mut previous_time: f64 = 0.0;
-    let mut work_duration_millis: u64 = 0;
 
+    // Initialize highest score
+    let mut highest_score = 0;
+
+    // Begin searching for addresses
     loop {
-        let current_pattern = PATTERN_BYTES[pattern_index];
-        pattern_index = (pattern_index + 1) % PATTERN_BYTES.len();
+        // Generate a random salt
+        let salt = FixedBytes::<4>::random();
 
-        let mut pattern = [0u8; 4];
-        pattern.copy_from_slice(&current_pattern);
-        let salt = FixedBytes::<4>::try_from(&pattern[..]).unwrap();
-
+        // Build the message buffer
         let message_buffer = Buffer::builder()
             .queue(ocl_pq.queue().clone())
             .flags(MemFlags::new().read_only())
@@ -310,175 +213,125 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             .copy_host_slice(&salt[..])
             .build()?;
 
-        let mut nonce: [u32; 1] = rng.gen();
-        let mut view_buf = [0; 8];
-        let mut nonce_buffer = Buffer::builder()
+        // Initialize the nonce
+        let nonce_init = rng.gen::<u32>();
+        let mut nonce = [nonce_init];
+
+        // Build the nonce buffer
+        let nonce_buffer = Buffer::builder()
             .queue(ocl_pq.queue().clone())
             .flags(MemFlags::new().read_only())
             .len(1)
             .copy_host_slice(&nonce)
             .build()?;
 
-        let mut solutions: Vec<u64> = vec![0; 1];
-        let solutions_buffer = Buffer::builder()
+        // Build the results buffer
+        let results_size = 6 * WORK_SIZE as usize;
+        let mut results: Vec<u32> = vec![0; results_size];
+        let results_buffer = Buffer::builder()
             .queue(ocl_pq.queue().clone())
             .flags(MemFlags::new().write_only())
-            .len(1)
-            .copy_host_slice(&solutions)
+            .len(results_size)
             .build()?;
 
-        loop {
-            let kern = ocl_pq
-                .kernel_builder("hashMessage")
-                .arg_named("message", None::<&Buffer<u8>>)
-                .arg_named("nonce", None::<&Buffer<u32>>)
-                .arg_named("solutions", None::<&Buffer<u64>>)
-                .build()?;
+        // Build the kernel
+let kern = ocl_pq
+.kernel_builder("hashMessage")
+.arg_named("message", &message_buffer)
+.arg_named("nonce", &nonce_buffer)
+.arg_named("results", &results_buffer)
+.build()?;
 
-            kern.set_arg("message", Some(&message_buffer))?;
-            kern.set_arg("nonce", Some(&nonce_buffer))?;
-            kern.set_arg("solutions", &solutions_buffer)?;
+// Inner loop to keep executing the kernel with updated nonce
+loop {
+// Enqueue the kernel
+unsafe { kern.enq()? };
 
-            unsafe { kern.enq()? };
+// Read the results
+results_buffer.read(&mut results).enq()?;
 
-            let mut now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            let current_time = now.as_secs() as f64;
-            let print_output = current_time - previous_time > 0.99;
-            previous_time = current_time;
+// Process the results
+for i in 0..WORK_SIZE as usize {
+    let idx = i * 6;
+    let score = results[idx];
+    if score > highest_score {
+        highest_score = score;
+        // Extract the address bytes
+        let mut address_bytes = [0u8; 20];
+        for j in 0..5 {
+            let val = results[idx + 1 + j];
+            address_bytes[4 * j] = (val >> 24) as u8;
+            address_bytes[4 * j + 1] = (val >> 16) as u8;
+            address_bytes[4 * j + 2] = (val >> 8) as u8;
+            address_bytes[4 * j + 3] = val as u8;
+        }
+        // Convert address to hex string
+        let address_hex = hex::encode(address_bytes);
 
-            if print_output {
-                term.clear_screen()?;
-                let total_runtime = current_time - start_time;
-                let total_runtime_hrs = total_runtime as u64 / 3600;
-                let total_runtime_mins = (total_runtime as u64 - total_runtime_hrs * 3600) / 60;
-                let total_runtime_secs = total_runtime
-                    - (total_runtime_hrs * 3600) as f64
-                    - (total_runtime_mins * 60) as f64;
-
-                let work_rate: u128 = WORK_FACTOR * cumulative_nonce as u128;
-                if total_runtime > 0.0 {
-                    rate = 1.0 / total_runtime;
-                }
-
-                LittleEndian::write_u64(&mut view_buf, (nonce[0] as u64) << 32);
-                let height = terminal_size().map(|(_w, Height(h))| h).unwrap_or(10);
-
-                term.write_line(&format!(
-                    "total runtime: {}:{:02}:{:02} ({} cycles)\t\t\t\
-                     work size per cycle: {}",
-                    total_runtime_hrs,
-                    total_runtime_mins,
-                    total_runtime_secs,
-                    cumulative_nonce,
-                    WORK_SIZE.separated_string(),
-                ))?;
-
-                term.write_line(&format!(
-                    "rate: {:.2} million attempts per second\t\t\t\
-                     total found: {} (highest score: {})",
-                    work_rate as f64 * rate,
-                    found,
-                    highest_score
-                ))?;
-
-                term.write_line(&format!(
-                    "current search space: {:0>16}xxxxxxxx{:08x}\t\t\
-                     threshold: {} leading or {} total zeroes",
-                    hex::encode(salt),  // Format to show full 16 chars
-                    BigEndian::read_u64(&view_buf),
-                    config.leading_zeroes_threshold,
-                    config.total_zeroes_threshold
-                ))?;
-
-                let rows = if height < 5 { 1 } else { height as usize - 4 };
-                let last_rows: Vec<String> = found_list.iter().cloned().rev().take(rows).collect();
-                let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
-                let recently_found = &ordered.join("\n");
-                term.write_line(recently_found)?;
-            }
-
-            cumulative_nonce += 1;
-            let work_start_time_millis = now.as_secs() * 1000 + now.subsec_nanos() as u64 / 1000000;
-
-            if work_duration_millis != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    work_duration_millis * 980 / 1000,
-                ));
-            }
-
-            solutions_buffer.read(&mut solutions).enq()?;
-
-            now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            work_duration_millis = (now.as_secs() * 1000 + now.subsec_nanos() as u64 / 1000000)
-                - work_start_time_millis;
-
-            if solutions[0] != 0 {
-                break;
-            }
-
-            nonce[0] += 1;
-            nonce_buffer = Buffer::builder()
-                .queue(ocl_pq.queue().clone())
-                .flags(MemFlags::new().read_write())
-                .len(1)
-                .copy_host_slice(&nonce)
-                .build()?;
+        // Corrected: Use the correct order of nonce components
+        let nonce_uint32_t = [i as u32, nonce[0]];
+        let mut nonce_bytes = [0u8; 8];
+        {
+            let mut cursor = std::io::Cursor::new(&mut nonce_bytes[..]);
+            cursor.write_u32::<LittleEndian>(nonce_uint32_t[0])?; // i as u32
+            cursor.write_u32::<LittleEndian>(nonce_uint32_t[1])?; // nonce[0]
         }
 
-        for &solution in &solutions {
-            if solution == 0 {
-                continue;
-            }
+        // Construct full_salt: calling_address + salt + nonce_bytes
+        let full_salt = [
+            &config.calling_address[..], // 20 bytes
+            &salt[..],                   // 4 bytes
+            &nonce_bytes[..],            // 8 bytes
+        ]
+        .concat();
 
-            let solution = solution.to_le_bytes();
+        // Verify the address
+        let mut data = Vec::with_capacity(1 + 20 + 32 + 32);
+        data.push(0xffu8); // Control character
+        data.extend_from_slice(&config.factory_address); // Factory address
+        data.extend_from_slice(&full_salt); // Full salt (includes calling address)
+        data.extend_from_slice(&config.init_code_hash); // Init code hash
 
-            let mut solution_message = [0; 85];
-            solution_message[0] = CONTROL_CHARACTER;
-            solution_message[1..21].copy_from_slice(&config.factory_address);
-            solution_message[21..41].copy_from_slice(&config.calling_address);
-            solution_message[41..45].copy_from_slice(&salt[..]);
-            solution_message[45..53].copy_from_slice(&solution);
-            solution_message[53..].copy_from_slice(&config.init_code_hash);
+        // Hash data using Keccak-256
+        let mut hasher = Keccak::v256();
+        hasher.update(&data);
+        let mut address_hash = [0u8; 32];
+        hasher.finalize(&mut address_hash);
 
-            let mut hash = Keccak::v256();
-            hash.update(&solution_message);
+        // Extract the address
+        let address_bytes_from_hash = &address_hash[12..]; // Last 20 bytes
+        let address_hex_from_hash = hex::encode(address_bytes_from_hash);
 
-            let mut res: [u8; 32] = [0; 32];
-            hash.finalize(&mut res);
+        // Compare the addresses
+        if address_hex_from_hash != address_hex {
+            println!(
+                "Address mismatch! Computed: {}, Expected: {}",
+                address_hex_from_hash, address_hex
+            );
+        } else {
+            println!("Address verified successfully.");
+        }
 
-            let address = <&Address>::try_from(&res[12..]).unwrap();
-            let address_hex = format!("{}", address);
+        // Output the result
+        let output = format!(
+            "0x{} => {} => {}",
+            hex::encode(full_salt),
+            address_hex,
+            highest_score,
+        );
+        println!("{}", output);
+    }
+}
 
-            if let Some(score) = score_address_hex(&address_hex) {
-                if score > 174 || score > highest_score {
-                    found += 1;
-                    let is_new_high_score = score > highest_score;
-                    highest_score = highest_score.max(score);
-                    
-                    let output = format!(
-                        "0x{}{}{} => {} => {}{}",
-                        hex::encode(config.calling_address),
-                        hex::encode(salt),
-                        hex::encode(solution),
-                        address,
-                        score,
-                        if is_new_high_score { " (NEW HIGH SCORE)" } else { "" }
-                    );
+// Increment the nonce
+nonce[0] += 1;
 
-                    let show = format!("{output} (Score: {score}{})", 
-                        if is_new_high_score { " - NEW HIGH SCORE!" } else { "" }
-                    );
-                    found_list.push(show.to_string());
-
-                    file.lock_exclusive().expect("Couldn't lock file.");
-                    writeln!(&file, "{output}")
-                        .expect("Couldn't write to `efficient_addresses.txt` file.");
-                    file.unlock().expect("Couldn't unlock file.");
-                }
-            }
+// Update the nonce buffer
+nonce_buffer.write(&nonce[..]).enq()?; // Use &nonce[..] here
         }
     }
 }
+
 
 #[track_caller]
 fn output_file() -> File {
@@ -490,116 +343,11 @@ fn output_file() -> File {
         .expect("Could not create or open `efficient_addresses.txt` file.")
 }
 
-fn get_score_check_code() -> String {
-    r#"
-    #define ADDR_LEN 20
-    #define SCORE_THRESHOLD 80
-    
-    // Precompute lookup table for nibble counting
-    __constant uchar nibble_is_four[16] = {0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0};
-    __constant uchar nibble_is_zero[16] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-
-    inline bool check_score(uchar* addr) {
-        // Quick check first 8 bytes (16 nibbles) for zeros
-        for (int i = 0; i < 8; i++) {
-            if (addr[i] != 0) return false;
-        }
-
-        int score = 80; // 8 leading zeros
-        int four_count = 0;
-        bool found_sequence = false;
-        bool found_first = false;
-        
-        // Process remaining bytes
-        for (int i = 8; i < ADDR_LEN; i++) {
-            uchar byte = addr[i];
-            uchar high = byte >> 4;
-            uchar low = byte & 0xF;
-            
-            // Check first non-zero must be 4
-            if (!found_first) {
-                if (high != 0) {
-                    if (high != 4) return false;
-                    found_first = true;
-                }
-            }
-            if (high == 4) four_count++;
-            
-            if (!found_first) {
-                if (low != 0) {
-                    if (low != 4) return false;
-                    found_first = true;
-                }
-            }
-            if (low == 4) four_count++;
-        }
-
-        if (four_count < 8) return false;
-        score += four_count;
-
-        // Check for 4444 sequence using sliding window
-        for (int i = 0; i < ADDR_LEN - 2; i++) {
-            // Check if we have four 4s in a row
-            int pos = i * 2;  // Position in nibbles
-            int count = 0;
-            
-            for (int j = 0; j < 4; j++) {
-                int curr_pos = pos + j;
-                uchar nibble;
-                if (curr_pos % 2 == 0) {
-                    nibble = addr[curr_pos/2] >> 4;
-                } else {
-                    nibble = addr[curr_pos/2] & 0xF;
-                }
-                if (nibble == 4) count++;
-                else break;
-            }
-            
-            if (count == 4) {
-                score += 40;
-                // Check next nibble after sequence
-                int next_pos = pos + 4;
-                if (next_pos < ADDR_LEN * 2) {
-                    uchar next_nibble;
-                    if (next_pos % 2 == 0) {
-                        next_nibble = addr[next_pos/2] >> 4;
-                    } else {
-                        next_nibble = addr[next_pos/2] & 0xF;
-                    }
-                    if (next_nibble != 4) score += 20;
-                }
-                found_sequence = true;
-                break;
-            }
-        }
-
-        if (!found_sequence) return false;
-
-        // Check last 4 nibbles
-        bool last_four = true;
-        for (int i = 0; i < 4; i++) {
-            int pos = (ADDR_LEN * 2) - 4 + i;
-            uchar nibble;
-            if (pos % 2 == 0) {
-                nibble = addr[pos/2] >> 4;
-            } else {
-                nibble = addr[pos/2] & 0xF;
-            }
-            if (nibble != 4) {
-                last_four = false;
-                break;
-            }
-        }
-        if (last_four) score += 20;
-
-        return score >= SCORE_THRESHOLD;
-    }
-    "#.to_string()
-}
-
+/// Creates the OpenCL kernel source code by populating the template with the
+/// values from the Config object.
 fn mk_kernel_src(config: &Config) -> String {
     let mut src = String::with_capacity(2048 + KERNEL_SRC.len());
-    
+
     let factory = config.factory_address.iter();
     let caller = config.calling_address.iter();
     let hash = config.init_code_hash.iter();
@@ -612,10 +360,7 @@ fn mk_kernel_src(config: &Config) -> String {
     let tz = config.total_zeroes_threshold;
     writeln!(src, "#define TOTAL_ZEROES {tz}").unwrap();
 
-    src.push_str(&get_score_check_code());
     src.push_str(KERNEL_SRC);
 
     src
 }
-
-
