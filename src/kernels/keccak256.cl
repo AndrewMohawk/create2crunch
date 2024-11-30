@@ -188,6 +188,57 @@ static inline void keccakf(ulong *a)
 #undef o
 }
 
+// Scoring function as per Uniswap competition rules
+static inline uint compute_score(uchar *digest) {
+  uchar nibbles[40];
+  for (int i = 0; i < 20; i++) {
+    uchar byte = digest[i];
+    nibbles[2*i] = (byte >> 4) & 0xF;
+    nibbles[2*i+1] = byte & 0xF;
+  }
+
+  uint score = 0;
+
+  // Count leading zero nibbles
+  int leading_zero_nibbles = 0;
+  for (int i = 0; i < 40; i++) {
+    if (nibbles[i] == 0) {
+      leading_zero_nibbles++;
+      score += 10;
+    } else {
+      break;
+    }
+  }
+
+  // Check if address starts with four consecutive 4s
+  if (nibbles[0] == 4 && nibbles[1] == 4 && nibbles[2] == 4 && nibbles[3] == 4) {
+    score += 40;
+
+    // 20 points if the first nibble after the four 4s is not a 4
+    if (nibbles[4] != 4) {
+      score += 20;
+    }
+  }
+
+  // Check if last four nibbles are all 4s
+  if (nibbles[36] == 4 && nibbles[37] == 4 && nibbles[38] == 4 && nibbles[39] == 4) {
+    score += 20;
+  }
+
+  // Count the total number of 4s in the address
+  int num_fours = 0;
+  for (int i = 0; i < 40; i++) {
+    if (nibbles[i] == 4) {
+      num_fours++;
+    }
+  }
+
+  // Add the total number of 4s to the score
+  score += num_fours;
+
+  return score;
+}
+
 #define hasTotal(d) ( \
   (!(d[0])) + (!(d[1])) + (!(d[2])) + (!(d[3])) + \
   (!(d[4])) + (!(d[5])) + (!(d[6])) + (!(d[7])) + \
@@ -226,7 +277,7 @@ static inline bool hasLeading(uchar const *d)
 __kernel void hashMessage(
   __constant uchar const *d_message,
   __constant uint const *d_nonce,
-  __global volatile ulong *restrict solutions
+  __global uint *results
 ) {
 
   ulong spongeBuffer[25];
@@ -351,17 +402,19 @@ __kernel void hashMessage(
   // Apply keccakf
   keccakf(spongeBuffer);
 
-  // determine if the address meets the constraints
-  if (
-    hasLeading(digest) 
-#if TOTAL_ZEROES <= 20
-    || hasTotal(digest)
-#endif
-  ) {
-    // To be honest, if we are using OpenCL, 
-    // we just need to write one solution for all practical purposes,
-    // since the chance of multiple solutions appearing
-    // in a single workset is extremely low.
-    solutions[0] = nonce.uint64_t;
+    // Compute the score
+  uint score = compute_score(digest);
+
+  // Write the score and address to the results buffer
+  uint idx = 6 * get_global_id(0);
+  results[idx] = score;
+
+  // Copy address bytes to results buffer
+  for (int i = 0; i < 5; i++) {
+    uint val = ((uint)digest[4*i] << 24) |
+              ((uint)digest[4*i + 1] << 16) |
+              ((uint)digest[4*i + 2] << 8) |
+              ((uint)digest[4*i + 3]);
+    results[idx + 1 + i] = val;
   }
 }
