@@ -41,6 +41,10 @@
 # pragma OPENCL EXTENSION   cl_amd_media_ops : enable
 #endif
 
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
+
+
 typedef union _nonce_t
 {
   ulong   uint64_t;
@@ -281,6 +285,7 @@ static inline bool hasLeading(uchar const *d)
 }
 #endif
 
+/*__attribute__((reqd_work_group_size(1024, 1, 1)))*/
 __kernel void hashMessage(
   __constant uchar const *d_message,
   __constant uint const *d_nonce,
