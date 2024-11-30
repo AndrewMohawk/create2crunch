@@ -24,20 +24,18 @@ const WORK_SIZE: u32 = 0xC0000000;
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
-const PATTERN_BYTES: [[u8; 4]; 12] = [
-    // Patterns optimized for maximum score potential (175+)
-    [0x00, 0x00, 0x44, 0x44],  // Leading zeros + 4444 (high probability for sequence)
-    [0x00, 0x44, 0x44, 0x40],  // Leading zeros + 444 + non-4 (guaranteed 20 point bonus)
-    [0x00, 0x00, 0x04, 0x44],  // More leading zeros + start of 4444
-    [0x00, 0x04, 0x44, 0x44],  // Leading zeros + potential 4444 end
-    [0x00, 0x44, 0x44, 0x44],  // Leading zeros + guaranteed 4444
-    [0x00, 0x00, 0x40, 0x44],  // More leading zeros + strategic 44
-    [0x40, 0x44, 0x44, 0x44],  // Strategic placement for maximum 4s
-    [0x44, 0x44, 0x44, 0x40],  // Immediate 4444 + non-4
-    [0x00, 0x00, 0x00, 0x44],  // Maximum zeros + 44
-    [0x00, 0x40, 0x44, 0x44],  // Strategic mix of zeros and 4s
-    [0x04, 0x44, 0x44, 0x44],  // Early 4 + guaranteed 4444
-    [0x44, 0x44, 0x44, 0x44],  // Maximum 4s pattern
+const PATTERN_BYTES: [[u8; 4]; 8] = [
+    // 9 leading zeros patterns
+    [0x00, 0x00, 0x00, 0x44],  // Maximum leading zeros + start of 4 sequence
+    [0x00, 0x00, 0x00, 0x40],  // Maximum leading zeros + alternative 4
+    // 10 leading zeros patterns
+    [0x00, 0x00, 0x00, 0x04],  // Extra leading zero potential + 4
+    [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros possible
+    // Backup patterns for 9 zeros with optimal scoring
+    [0x00, 0x00, 0x44, 0x44],  // Leading zeros + 4444 sequence
+    [0x00, 0x00, 0x44, 0x40],  // Leading zeros + 444 + non-4
+    [0x00, 0x00, 0x44, 0x45],  // Leading zeros + 444 + alternative non-4
+    [0x00, 0x00, 0x44, 0x43],  // Leading zeros + 444 + another non-4
 ];
 // const PATTERN_BYTES: [[u8; 4]; 4] = [
 //     [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
@@ -500,7 +498,7 @@ fn output_file() -> File {
 fn get_score_check_code() -> String {
     r#"
     #define ADDR_LEN 20
-    #define SCORE_THRESHOLD 85
+    #define SCORE_THRESHOLD 80
     
     // Precompute lookup table for nibble counting
     __constant uchar nibble_is_four[16] = {0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0};
@@ -624,3 +622,5 @@ fn mk_kernel_src(config: &Config) -> String {
 
     src
 }
+
+
