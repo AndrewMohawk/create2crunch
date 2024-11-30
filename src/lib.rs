@@ -24,18 +24,13 @@ const WORK_SIZE: u32 = 0xC0000000;
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
-const PATTERN_BYTES: [[u8; 4]; 8] = [
-    // 9 leading zeros patterns
-    [0x00, 0x00, 0x00, 0x44],  // Maximum leading zeros + start of 4 sequence
-    [0x00, 0x00, 0x00, 0x40],  // Maximum leading zeros + alternative 4
-    // 10 leading zeros patterns
-    [0x00, 0x00, 0x00, 0x04],  // Extra leading zero potential + 4
-    [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros possible
-    // Backup patterns for 9 zeros with optimal scoring
-    [0x00, 0x00, 0x44, 0x44],  // Leading zeros + 4444 sequence
-    [0x00, 0x00, 0x44, 0x40],  // Leading zeros + 444 + non-4
-    [0x00, 0x00, 0x44, 0x45],  // Leading zeros + 444 + alternative non-4
-    [0x00, 0x00, 0x44, 0x43],  // Leading zeros + 444 + another non-4
+const PATTERN_BYTES: [[u8; 4]; 6] = [
+    [0x00, 0x00, 0x00, 0x00],  // All zeros for maximum leading zeros
+    [0x00, 0x00, 0x00, 0x04],  // All zeros with trailing 4
+    [0x00, 0x00, 0x00, 0x40],  // All zeros with 4 in high nibble
+    [0x00, 0x00, 0x00, 0x44],  // All zeros with 44
+    [0x00, 0x00, 0x04, 0x44],  // Nearly all zeros with 444
+    [0x00, 0x00, 0x44, 0x44],  // Zeros with 4444
 ];
 // const PATTERN_BYTES: [[u8; 4]; 4] = [
 //     [0x00, 0x00, 0x00, 0x00],  // Maximum leading zeros
@@ -387,9 +382,9 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                 ))?;
 
                 term.write_line(&format!(
-                    "current search space: {}xxxxxxxx{:08x}\t\t\
+                    "current search space: {:0>16}xxxxxxxx{:08x}\t\t\
                      threshold: {} leading or {} total zeroes",
-                    hex::encode(salt),
+                    hex::encode(salt),  // Format to show full 16 chars
                     BigEndian::read_u64(&view_buf),
                     config.leading_zeroes_threshold,
                     config.total_zeroes_threshold
