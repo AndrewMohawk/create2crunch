@@ -199,6 +199,8 @@ static inline uint compute_score(uchar *digest) {
 
   uint score = 0;
 
+  int first_non_zero_nibble_index = -1;
+
   // Count leading zero nibbles
   int leading_zero_nibbles = 0;
   for (int i = 0; i < 40; i++) {
@@ -206,8 +208,13 @@ static inline uint compute_score(uchar *digest) {
       leading_zero_nibbles++;
       score += 10;
     } else {
+      first_non_zero_nibble_index = i;
       break;
     }
+  }
+
+  if (first_non_zero_nibble_index == -1 || nibbles[first_non_zero_nibble_index] != 4) {
+    return 0;
   }
 
   // Check if address starts with four consecutive 4s
