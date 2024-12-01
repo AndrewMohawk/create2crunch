@@ -289,7 +289,7 @@ static inline bool hasLeading(uchar const *d)
 __kernel void hashMessage(
   __constant uchar const *d_message,
   __constant uint const *d_nonce,
-  __global uint *results
+  __global uint *solutions
 ) {
 
   ulong spongeBuffer[25];
@@ -414,19 +414,16 @@ __kernel void hashMessage(
   // Apply keccakf
   keccakf(spongeBuffer);
 
-    // Compute the score
   uint score = compute_score(digest);
 
-  // Write the score and address to the results buffer
-  uint idx = 6 * get_global_id(0);
-  results[idx] = score;
-
-  // Copy address bytes to results buffer
-  for (int i = 0; i < 5; i++) {
-    uint val = ((uint)digest[4*i] << 24) |
-              ((uint)digest[4*i + 1] << 16) |
-              ((uint)digest[4*i + 2] << 8) |
-              ((uint)digest[4*i + 3]);
-    results[idx + 1 + i] = val;
+  if (score > 100) {
+    uint index = atom_inc((volatile __global uint *)&solutions[0]);
+    if (index < MAX_SOLUTIONS) {
+      uint nonce_hi = (uint)(nonce.uint64_t >> 32);
+      uint nonce_lo = (uint)(nonce.uint64_t & 0xFFFFFFFF);
+      solutions[1 + index * 3] = nonce_hi;
+      solutions[1 + index * 3 + 1] = nonce_lo;
+      solutions[1 + index * 3 + 2] = score;
+    }
   }
 }
