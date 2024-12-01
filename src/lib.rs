@@ -136,6 +136,9 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
         .map(|_| Queue::new(&context, device, None))
         .collect::<ocl::Result<_>>()?;
 
+    // Set a minimum score threshold to reduce the number of solutions collected
+    let min_score_threshold: u32 = 70; // Adjust as needed
+
     let program = Program::builder()
         .devices(device)
         .src(mk_kernel_src(&config))
@@ -190,6 +193,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                 .arg(&buffer_set.message)
                 .arg(&buffer_set.nonce)
                 .arg(&buffer_set.solutions)
+                .arg(min_score_threshold) // Pass the minimum score threshold to the kernel
                 .global_work_size(WORK_SIZE / NUM_PARALLEL_BUFFERS as u32)
                 .local_work_size(WORKGROUP_SIZE)
                 .build()
@@ -200,6 +204,9 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     let mut total_hashes: u64 = 0;
     let start_time = Instant::now();
     let mut last_report = Instant::now();
+
+    // Variable to keep track of the highest score found so far
+    let mut highest_score: u32 = 0;
 
     loop {
         // Reset solutions buffers before each kernel execution
@@ -264,7 +271,13 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
                     let nonce_value = ((nonce_hi as u64) << 32) | (nonce_lo as u64);
 
-                    process_result(&config, nonce_value, score, &buffer_set.message)?;
+                    // Compare the score with highest_score
+                    if score > highest_score {
+                        highest_score = score;
+                        // Print the new highest score
+                        println!("New highest score found: {}", highest_score);
+                        process_result(&config, nonce_value, score, &buffer_set.message)?;
+                    }
                 }
             }
 
@@ -287,7 +300,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
         if elapsed_since_last_report >= Duration::from_secs(1) {
             let elapsed = start_time.elapsed().as_secs_f64();
             let hashes_per_sec = total_hashes as f64 / elapsed;
-            // lets make it million hashes per second
+            // Let's make it million hashes per second
             let hashes_per_sec = hashes_per_sec / 1_000_000.0;
             println!(
                 "Time Elapsed: {:.2}s, Total Hashes: {}, Hash Rate: {:.2} MH/s",
@@ -333,7 +346,7 @@ fn process_result(
     let address_bytes = &address_hash[12..];
     let address_hex = hex::encode(address_bytes);
 
-    // Output the result
+    // Print the result
     println!(
         "0x{} => {} => {}",
         hex::encode(&full_salt),
@@ -375,3 +388,4 @@ fn mk_kernel_src(config: &Config) -> String {
     src.push_str(KERNEL_SRC);
     src
 }
+
