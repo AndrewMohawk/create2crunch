@@ -32,6 +32,7 @@
 
 #define OPENCL_PLATFORM_UNKNOWN 0
 #define OPENCL_PLATFORM_AMD   2
+#define MAX_LOCAL_SOLUTIONS 10
 
 #ifndef PLATFORM
 # define PLATFORM       OPENCL_PLATFORM_UNKNOWN
@@ -289,9 +290,18 @@ static inline bool hasLeading(uchar const *d)
 __kernel void hashMessage(
   __constant uchar const *d_message,
   __constant uint const *d_nonce,
-  __global uint *solutions
+  __global uint *solutions,
+  const uint min_score_threshold // New argument
 ) {
+// Define local memory for per-workgroup solution aggregation
+  __local uint local_solutions[MAX_LOCAL_SOLUTIONS * 3];
+  __local uint local_solution_count;
 
+  // Initialize local_solution_count
+  if (get_local_id(0) == 0) {
+    local_solution_count = 0;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
   ulong spongeBuffer[25];
 
 #define sponge ((uchar *) spongeBuffer)
@@ -416,14 +426,32 @@ __kernel void hashMessage(
 
   uint score = compute_score(digest);
 
-  if (score > 100) {
-    uint index = atom_inc((volatile __global uint *)&solutions[0]);
-    if (index < MAX_SOLUTIONS) {
-      uint nonce_hi = (uint)(nonce.uint64_t >> 32);
-      uint nonce_lo = (uint)(nonce.uint64_t & 0xFFFFFFFF);
-      solutions[1 + index * 3] = nonce_hi;
-      solutions[1 + index * 3 + 1] = nonce_lo;
-      solutions[1 + index * 3 + 2] = score;
+  if (score >= min_score_threshold) {
+    // Each thread tries to store its solution in local_solutions
+    uint idx = atomic_inc(&local_solution_count);
+    if (idx < MAX_LOCAL_SOLUTIONS) {
+      local_solutions[idx * 3 + 0] = (uint)(nonce.uint64_t >> 32);
+      local_solutions[idx * 3 + 1] = (uint)(nonce.uint64_t & 0xFFFFFFFF);
+      local_solutions[idx * 3 + 2] = score;
+    }
+  }
+
+  // Synchronize the workgroup
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // After all threads have written to local_solutions, the workgroup leader writes to global memory
+  if (get_local_id(0) == 0 && local_solution_count > 0) {
+    uint global_idx = atomic_add((volatile __global uint *)&solutions[0], local_solution_count);
+    if (global_idx + local_solution_count <= MAX_SOLUTIONS) {
+      for (uint i = 0; i < local_solution_count; ++i) {
+        solutions[1 + (global_idx + i) * 3 + 0] = local_solutions[i * 3 + 0];
+        solutions[1 + (global_idx + i) * 3 + 1] = local_solutions[i * 3 + 1];
+        solutions[1 + (global_idx + i) * 3 + 2] = local_solutions[i * 3 + 2];
+      }
+    } else {
+      // Handle the case where global solutions buffer is full
+      // For simplicity, we can ignore extra solutions
     }
   }
 }
+
