@@ -15,7 +15,7 @@ mod reward;
 pub use reward::Reward;
 
 // Constants
-const WORK_SIZE: u32 = 0xD0000000; // Adjust as needed
+const WORK_SIZE: u32 = 0x40000000; // Adjust as needed
 const WORKGROUP_SIZE: u32 = 256;
 const NUM_PARALLEL_BUFFERS: usize = 4;
 const MAX_SOLUTIONS: usize = 1024; // Maximum number of solutions to store per buffer
@@ -287,9 +287,8 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
         if elapsed_since_last_report >= Duration::from_secs(1) {
             let elapsed = start_time.elapsed().as_secs_f64();
             let hashes_per_sec = total_hashes as f64 / elapsed;
-            // lets convert to millions of hashes per second
+            // lets make it million hashes per second
             let hashes_per_sec = hashes_per_sec / 1_000_000.0;
-
             println!(
                 "Time Elapsed: {:.2}s, Total Hashes: {}, Hash Rate: {:.2} MH/s",
                 elapsed, total_hashes, hashes_per_sec
