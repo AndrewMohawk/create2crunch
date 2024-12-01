@@ -8,19 +8,17 @@ use ocl::{Buffer, Context, Device, Kernel, MemFlags, Platform, Program, Queue};
 use rand::{thread_rng, Rng};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
+use std::time::{Duration, Instant};
 use tiny_keccak::{Hasher, Keccak};
 
 mod reward;
 pub use reward::Reward;
 
-const WORK_SIZE: u32 = 0x80000000;
+// Constants
+const WORK_SIZE: u32 = 0xD0000000; // Adjust as needed
 const WORKGROUP_SIZE: u32 = 256;
 const NUM_PARALLEL_BUFFERS: usize = 4;
-
-/* Server */
-// const WORK_SIZE: u32 = 0xD0000000;
-// const WORKGROUP_SIZE: u32 = 1024;
-// const NUM_PARALLEL_BUFFERS: usize = 256;
+const MAX_SOLUTIONS: usize = 1024; // Maximum number of solutions to store per buffer
 
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 
@@ -108,10 +106,11 @@ impl Config {
     }
 }
 
+// Update BufferSet to include solutions buffer of u32 type
 struct BufferSet {
     message: Buffer<u8>,
     nonce: Buffer<u32>,
-    results: Buffer<u32>,
+    solutions: Buffer<u32>,
 }
 
 pub fn gpu(config: Config) -> ocl::Result<()> {
@@ -143,12 +142,10 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
         .build(&context)?;
 
     let mut rng = thread_rng();
-    let mut highest_score = 0;
 
     let mut buffer_sets: Vec<BufferSet> = Vec::with_capacity(NUM_PARALLEL_BUFFERS);
-    let results_size = 6 * (WORK_SIZE as usize / NUM_PARALLEL_BUFFERS);
 
-    // Create buffer sets with optimized memory flags
+    // Create buffer sets
     for queue in &queues {
         let salt = FixedBytes::<4>::random();
         let nonce_init = rng.gen::<u32>();
@@ -162,21 +159,23 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
         let nonce_buffer = Buffer::builder()
             .queue(queue.clone())
-            .flags(MemFlags::new().read_only())
+            .flags(MemFlags::new().read_write())
             .len(1)
             .copy_host_slice(&[nonce_init])
             .build()?;
 
-        let results_buffer = Buffer::builder()
+        // Solutions buffer: First element is the count, followed by solution triplets (nonce_hi, nonce_lo, score)
+        let solutions_buffer = Buffer::<u32>::builder()
             .queue(queue.clone())
-            .flags(MemFlags::new().write_only())
-            .len(results_size)
+            .flags(MemFlags::new().read_write())
+            .len(1 + MAX_SOLUTIONS * 3)
+            .fill_val(0u32)
             .build()?;
 
         buffer_sets.push(BufferSet {
             message: message_buffer,
             nonce: nonce_buffer,
-            results: results_buffer,
+            solutions: solutions_buffer,
         });
     }
 
@@ -190,16 +189,25 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                 .queue(queue.clone())
                 .arg(&buffer_set.message)
                 .arg(&buffer_set.nonce)
-                .arg(&buffer_set.results)
+                .arg(&buffer_set.solutions)
                 .global_work_size(WORK_SIZE / NUM_PARALLEL_BUFFERS as u32)
                 .local_work_size(WORKGROUP_SIZE)
                 .build()
         })
         .collect::<ocl::Result<_>>()?;
 
-    let mut results = vec![0u32; results_size];
+    // Timing variables
+    let mut total_hashes: u64 = 0;
+    let start_time = Instant::now();
+    let mut last_report = Instant::now();
 
     loop {
+        // Reset solutions buffers before each kernel execution
+        for buffer_set in &buffer_sets {
+            let zero_u32 = vec![0u32; 1];
+            buffer_set.solutions.write(&zero_u32).offset(0).enq()?;
+        }
+
         // Launch kernels asynchronously
         for kernel in &kernels {
             unsafe {
@@ -212,19 +220,51 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             }
         }
 
+        // Wait for all kernels to finish
+        for kernel in &kernels {
+            kernel.default_queue().unwrap().finish()?;
+        }
+
         // Process results and update nonces
         for buffer_set in buffer_sets.iter() {
-            // Read results and ensure completion
-            buffer_set.results.read(&mut results).enq()?;
-            buffer_set.results.default_queue().unwrap().finish()?;
+            // Read the number of solutions found
+            let mut solution_count_vec = vec![0u32; 1];
+            buffer_set
+                .solutions
+                .read(&mut solution_count_vec)
+                .offset(0)
+                .len(1)
+                .enq()?;
+            let mut solution_count = solution_count_vec[0] as usize;
 
-            // Process results
-            for i in 0..results_size / 6 {
-                let idx = i * 6;
-                let score = results[idx];
-                if score > highest_score {
-                    highest_score = score;
-                    process_result(&config, &results[idx..idx + 6], score, buffer_set, i as u32)?;
+            // Ensure solution_count does not exceed MAX_SOLUTIONS
+            if solution_count > MAX_SOLUTIONS {
+                eprintln!(
+                    "Warning: solution_count ({}) exceeds MAX_SOLUTIONS ({}). Limiting to MAX_SOLUTIONS.",
+                    solution_count, MAX_SOLUTIONS
+                );
+                solution_count = MAX_SOLUTIONS;
+            }
+
+            if solution_count > 0 {
+                // Read the solutions from the buffer
+                let mut solutions = vec![0u32; solution_count * 3];
+                buffer_set
+                    .solutions
+                    .read(&mut solutions)
+                    .offset(1)
+                    .len(solution_count * 3)
+                    .enq()?;
+
+                // Process each solution
+                for i in 0..solution_count {
+                    let nonce_hi = solutions[i * 3];
+                    let nonce_lo = solutions[i * 3 + 1];
+                    let score = solutions[i * 3 + 2];
+
+                    let nonce_value = ((nonce_hi as u64) << 32) | (nonce_lo as u64);
+
+                    process_result(&config, nonce_value, score, &buffer_set.message)?;
                 }
             }
 
@@ -238,41 +278,40 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             buffer_set.nonce.write(&nonce_vec).enq()?;
             buffer_set.nonce.default_queue().unwrap().finish()?;
         }
+
+        // Update total hashes computed
+        total_hashes += WORK_SIZE as u64;
+
+        // Report performance every second
+        let elapsed_since_last_report = last_report.elapsed();
+        if elapsed_since_last_report >= Duration::from_secs(1) {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let hashes_per_sec = total_hashes as f64 / elapsed;
+            // lets convert to millions of hashes per second
+            let hashes_per_sec = hashes_per_sec / 1_000_000.0;
+
+            println!(
+                "Time Elapsed: {:.2}s, Total Hashes: {}, Hash Rate: {:.2} MH/s",
+                elapsed, total_hashes, hashes_per_sec
+            );
+
+            last_report = Instant::now();
+        }
     }
 }
 
 fn process_result(
     config: &Config,
-    result_slice: &[u32],
+    nonce_value: u64,
     score: u32,
-    buffer_set: &BufferSet,
-    work_idx: u32,
+    message_buffer: &Buffer<u8>,
 ) -> ocl::Result<()> {
-    let mut address_bytes = [0u8; 20];
-    for j in 0..5 {
-        let val = result_slice[j + 1];
-        address_bytes[4 * j] = (val >> 24) as u8;
-        address_bytes[4 * j + 1] = (val >> 16) as u8;
-        address_bytes[4 * j + 2] = (val >> 8) as u8;
-        address_bytes[4 * j + 3] = val as u8;
-    }
-
-    let address_hex = hex::encode(address_bytes);
-
-    let mut nonce_vec = vec![0u32; 1];
-    buffer_set.nonce.read(&mut nonce_vec).enq()?;
-
-    let nonce_uint32_t = [work_idx, nonce_vec[0]];
-    let mut nonce_bytes = [0u8; 8];
-    {
-        let mut cursor = std::io::Cursor::new(&mut nonce_bytes[..]);
-        cursor.write_u32::<LittleEndian>(nonce_uint32_t[0])?;
-        cursor.write_u32::<LittleEndian>(nonce_uint32_t[1])?;
-    }
-
+    // Read the message (salt) from the message buffer
     let mut message_vec = vec![0u8; 4];
-    buffer_set.message.read(&mut message_vec).enq()?;
+    message_buffer.read(&mut message_vec).enq()?;
 
+    // Construct the full salt
+    let nonce_bytes = nonce_value.to_le_bytes();
     let full_salt = [
         &config.calling_address[..],
         &message_vec[..],
@@ -280,7 +319,7 @@ fn process_result(
     ]
     .concat();
 
-    // Verify the address
+    // Reconstruct the address
     let mut data = Vec::with_capacity(1 + 20 + 32 + 32);
     data.push(0xffu8);
     data.extend_from_slice(&config.factory_address);
@@ -292,24 +331,16 @@ fn process_result(
     let mut address_hash = [0u8; 32];
     hasher.finalize(&mut address_hash);
 
-    let address_hex_from_hash = hex::encode(&address_hash[12..]);
+    let address_bytes = &address_hash[12..];
+    let address_hex = hex::encode(address_bytes);
 
-    if address_hex_from_hash != address_hex {
-        println!(
-            "Address mismatch! Computed: {}, Expected: {}",
-            address_hex_from_hash, address_hex
-        );
-    } else {
-        println!("Address verified successfully.");
-    }
-
-    let output = format!(
+    // Output the result
+    println!(
         "0x{} => {} => {}",
-        hex::encode(full_salt),
+        hex::encode(&full_salt),
         address_hex,
         score,
     );
-    println!("{}", output);
 
     Ok(())
 }
@@ -340,6 +371,7 @@ fn mk_kernel_src(config: &Config) -> String {
     let tz = config.total_zeroes_threshold;
     writeln!(src, "#define TOTAL_ZEROES {tz}").unwrap();
     writeln!(src, "#define LOCAL_SIZE {}", WORKGROUP_SIZE).unwrap();
+    writeln!(src, "#define MAX_SOLUTIONS {}", MAX_SOLUTIONS).unwrap();
 
     src.push_str(KERNEL_SRC);
     src
